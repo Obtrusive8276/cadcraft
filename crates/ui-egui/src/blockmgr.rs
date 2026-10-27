@@ -191,6 +191,26 @@ pub fn reference_count(d: &Drawing, name: &str) -> usize {
 /// allowed when building a single palette thumbnail before returning an empty placeholder.
 const MAX_PREVIEW_BUDGET: usize = 8_192;
 
+/// Account for all attribute data cloned for bounds and processed by the renderer.
+fn preview_insert_cost(ins: &cadcraft_doc::Insert, remaining: usize) -> Option<usize> {
+    let mut cost = 1usize.checked_add(ins.block.len())?.checked_add(ins.attribs.len())?;
+    if cost > remaining {
+        return None;
+    }
+    for a in &ins.attribs {
+        cost = cost.checked_add(a.tag.len())?.checked_add(a.prompt.len())?.checked_add(a.text.value.len())?.checked_add(a.text.style.len())?;
+        cost = cost.checked_add(a.props.layer.as_ref().map_or(0, String::len))?.checked_add(a.props.linetype.as_ref().map_or(0, String::len))?;
+        if let Some(m) = &a.multiline {
+            cost = cost.checked_add(m.read_as.len())?.checked_add(m.mtext.contents.len())?.checked_add(m.mtext.style.len())?;
+            cost = cost.checked_add(m.mtext.columns.as_ref().map_or(0, |c| c.heights.len()))?;
+        }
+        if cost > remaining {
+            return None;
+        }
+    }
+    Some(cost)
+}
+
 /// Charge polyline, wipeout and leader input before bounds traversal clones vertices, and reserve
 /// a conservative tessellation/triangulation cost before rendering. Curved segments can emit up
 /// to 4097 points at any zoom (`geom::arc_segments`); wide bands and wipeouts also emit triangles
@@ -198,6 +218,7 @@ const MAX_PREVIEW_BUDGET: usize = 8_192;
 /// arrays, not just top-level entities.
 fn preview_entity_cost(kind: &EntityKind, remaining: usize) -> Option<usize> {
     let cost = match kind {
+        EntityKind::Insert(ins) => preview_insert_cost(ins, remaining)?,
         EntityKind::LwPolyline(p) => {
             if p.vertices.len() > remaining {
                 return None;
@@ -257,7 +278,11 @@ fn preview_entity_cost(kind: &EntityKind, remaining: usize) -> Option<usize> {
                 cost.checked_add(points)?.checked_add(rendered_points.div_ceil(8))
             })?;
             let text = m.text.as_ref().map_or(0, |t| t.contents.len());
-            1usize.checked_add(leaders)?.checked_add(text)?
+            let block = match &m.block {
+                Some(ins) => preview_insert_cost(ins, remaining)?,
+                None => 0,
+            };
+            1usize.checked_add(leaders)?.checked_add(text)?.checked_add(block)?
         }
         _ => 1,
     };
@@ -537,7 +562,7 @@ pub fn grab_block(app: &mut CadApp, name: &str, st: &State) {
     if !st.prompt_rotation {
         let rot = if st.rotation.is_finite() { st.rotation } else { 0.0 };
         let _ = app.session.input(cadcraft_engine::Input::Keyword("Rotate".into()));
-        let _ = app.session.input(cadcraft_engine::Input::Text(format!("{rot}")));
+        let _ = app.session.input(cadcraft_engine::Input::Text(format!("<<{rot}")));
     }
     if st.repeat {
         let _ = app.session.input(cadcraft_engine::Input::Keyword("Repeat".into()));
@@ -1210,6 +1235,43 @@ mod tests {
         assert!(cache.references.is_none());
     }
 
+    #[test]
+    fn attribute_previews_are_budgeted_before_bounds_and_rendering() {
+        use cadcraft_doc::{Block, Drawing, Entity, Handle};
+        let attribute: cadcraft_doc::Attrib = serde_json::from_value(json!({
+            "tag": "A", "text": {"insert": [0, 0, 0], "height": 1, "value": "ok"}
+        }))
+        .unwrap();
+        let mut insert: cadcraft_doc::Insert = serde_json::from_value(json!({
+            "block": "Missing", "insert": [0, 0, 0], "scale": [1, 1, 1], "attribs": []
+        }))
+        .unwrap();
+        let mut d = Drawing::default();
+        insert.attribs.push(attribute.clone());
+        let mut normal = Block::new("Normal");
+        normal.entities.push(Entity::new(Handle(1), EntityKind::Insert(insert.clone())));
+        d.blocks.insert("Normal".into(), Arc::new(normal));
+        assert!(!super::build(&d, "Normal").unwrap().0.prims.is_empty());
+
+        insert.attribs = vec![attribute.clone(); super::MAX_PREVIEW_BUDGET + 1];
+        assert!(super::preview_insert_cost(&insert, super::MAX_PREVIEW_BUDGET).is_none());
+        let mut large = Block::new("Large");
+        large.entities.push(Entity::new(Handle(2), EntityKind::Insert(insert.clone())));
+        d.blocks.insert("Large".into(), Arc::new(large));
+        let mut nested = Block::new("Nested");
+        insert.block = "Large".into();
+        insert.attribs.clear();
+        nested.entities.push(Entity::new(Handle(3), EntityKind::Insert(insert.clone())));
+        d.blocks.insert("Nested".into(), Arc::new(nested));
+        for name in ["Large", "Nested"] {
+            assert!(super::build(&d, name).unwrap().0.prims.is_empty());
+        }
+        let mut long = attribute;
+        long.text.value = "x".repeat(super::MAX_PREVIEW_BUDGET + 1);
+        insert.attribs.push(long);
+        assert!(super::preview_insert_cost(&insert, super::MAX_PREVIEW_BUDGET).is_none());
+    }
+
     /// Reject oversized hatch boundaries before bounds/tessellation, including nested references.
     #[test]
     fn oversized_hatch_previews_use_placeholders_before_expensive_processing() {
@@ -1567,6 +1629,10 @@ mod tests {
         let h = c["handle"].as_str().unwrap().to_string();
         app.session.execute("block", &json!({"name": "Valve", "base": [0, 0], "handles": [h], "keep": "delete"})).unwrap();
 
+        let header = &mut app.session.doc_mut().unwrap().header;
+        header.set_i64("AUNITS", 3);
+        header.set_f64("ANGBASE", 0.5);
+        header.set_i64("ANGDIR", 1);
         let st = State { scale_x: 2.0, scale_y: 1.5, rotation: 90.0, ..Default::default() };
         grab_block(&mut app, "Valve", &st);
 
