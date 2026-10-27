@@ -75,6 +75,8 @@ pub struct State {
     pub show_options: bool,
     /// Whether the currently running `INSERT` was started by this palette with repeat placement enabled.
     pub repeating: bool,
+    /// Whether the active insertion was grabbed from this palette.
+    pub grabbed: bool,
     /// The new name while renaming the selected block.
     pub rename: Option<String>,
     /// The last message (a refused delete or rename).
@@ -98,6 +100,7 @@ impl Default for State {
             grab_on_click: true,
             show_options: true,
             repeating: false,
+            grabbed: false,
             rename: None,
             note: None,
         }
@@ -944,6 +947,7 @@ fn body(ui: &mut egui::Ui, d: &Drawing, v: &View, st: &mut State, cache: &mut Pr
 
 /// Cancel an in-progress `INSERT` and stop repeat placement.
 fn cancel_pending_insert(app: &mut CadApp, st: &mut State) {
+    st.grabbed = false;
     st.repeating = false;
     if app.session.running.as_ref().is_some_and(|r| r.id == "insert") {
         app.session.cancel();
@@ -952,6 +956,9 @@ fn cancel_pending_insert(app: &mut CadApp, st: &mut State) {
 
 /// Do what a button asked; false when the manager window should close (a command takes over).
 fn apply(app: &mut CadApp, st: &mut State, act: Option<Act>, esc_pressed: bool) -> bool {
+    if app.session.running.as_ref().is_none_or(|r| r.id != "insert") {
+        st.grabbed = false;
+    }
     if esc_pressed {
         if st.repeating {
             st.repeat = false;
@@ -963,7 +970,8 @@ fn apply(app: &mut CadApp, st: &mut State, act: Option<Act>, esc_pressed: bool) 
             st.rename = None;
             grab_block(app, &n, st);
             // Only track repeat-placement when the palette's own INSERT started.
-            st.repeating = st.repeat && app.session.running.as_ref().is_some_and(|r| r.id == "insert");
+            st.grabbed = app.session.running.as_ref().is_some_and(|r| r.id == "insert");
+            st.repeating = st.repeat && st.grabbed;
             return true;
         }
         Some(Act::Edit(n)) => {
@@ -1040,6 +1048,7 @@ fn apply(app: &mut CadApp, st: &mut State, act: Option<Act>, esc_pressed: bool) 
                     st.repeating = false;
                 }
             } else if st.repeat
+                && st.grabbed
                 && app.session.running.as_ref().is_some_and(|r| r.id == "insert")
                 && app.session.input(cadcraft_engine::Input::Keyword("Repeat".into())).is_ok()
             {
@@ -1612,6 +1621,40 @@ mod tests {
             let count = super::cached_preview_count(&ctx);
             assert!(count > 0 && count < 40, "mode {mode:?} should keep only visible blocks in memory, got {count}");
         }
+    }
+
+    #[test]
+    fn repeat_preference_only_arms_palette_insertions() {
+        let mut app = CadApp::new(Session::new(), Services::default());
+        let circle = app.session.execute("circle", &json!({"center": [0, 0], "radius": 2})).unwrap();
+        app.session.execute("block", &json!({"name": "Pin", "base": [0, 0], "handles": [circle["handle"]], "keep": "delete"})).unwrap();
+        let mut st = State { repeat: true, ..Default::default() };
+
+        // A command-line insertion must finish after one placement despite the palette preference.
+        app.session.start("insert").unwrap();
+        app.session.input(Input::Text("Pin".into())).unwrap();
+        super::apply(&mut app, &mut st, None, false);
+        assert!(!st.repeating);
+        app.session.input(Input::Point(Vec2::new(10.0, 0.0))).unwrap();
+        app.session.input(Input::Enter).unwrap(); // X scale
+        app.session.input(Input::Enter).unwrap(); // Y scale
+        app.session.input(Input::Text("0".into())).unwrap(); // Rotation
+        assert!(app.session.running.is_none());
+        super::apply(&mut app, &mut st, None, true);
+        assert!(st.repeat);
+
+        // Enabling Repeat after grabbing from the palette still arms repeated placement.
+        st.repeat = false;
+        super::apply(&mut app, &mut st, Some(super::Act::Grab("Pin".into())), false);
+        assert!(st.grabbed);
+        st.repeat = true;
+        super::apply(&mut app, &mut st, None, false);
+        app.session.input(Input::Point(Vec2::new(20.0, 0.0))).unwrap();
+        assert!(app.session.running.is_some());
+        assert!(st.repeating);
+        super::apply(&mut app, &mut st, None, true);
+        assert!(!st.grabbed);
+        assert!(app.session.running.is_none());
     }
 
     /// Verify repeat-placement re-grabbing, Escape cancellation, and cancellation when another command starts.
