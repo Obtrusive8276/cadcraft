@@ -139,27 +139,41 @@ pub(super) fn draw(b: &mut Builder, ctx: &Ctx, e: &Entity, h: &Hatch, rgb: Ink, 
 const MAX_ISLAND_WORK: usize = 20_000_000;
 
 /// True when two polygons have the same vertices (ignoring cyclic shift and winding order).
-fn same_polygon(a: &[Vec2], b: &[Vec2]) -> bool {
+fn same_polygon(a: &[Vec2], b: &[Vec2], budget: Option<&HatchBudget>) -> Option<bool> {
     if a.len() != b.len() {
-        return false;
+        return Some(false);
     }
     let n = a.len();
     if n == 0 {
-        return true;
+        return Some(true);
     }
-    let near = |p1: Vec2, p2: Vec2| p1.near(p2, 1e-4);
-    (0..n).any(|k| (0..n).all(|i| near(a[i], b[(i + k) % n]))) || (0..n).any(|k| (0..n).all(|i| near(a[i], b[(k + n - (i % n)) % n])))
+    for k in 0..n {
+        for reverse in [false, true] {
+            let Some((left, right)) = b.get(..k).zip(b.get(k..)) else { return Some(false) };
+            let forward = right.iter().chain(left.iter());
+            let backward = b.get(..=k)?.iter().rev().chain(b.get(k + 1..)?.iter().rev());
+            let mut matches = true;
+            let iter: &mut dyn Iterator<Item = &Vec2> = if reverse { &mut backward.clone() } else { &mut forward.clone() };
+            for (p, q) in a.iter().zip(iter) {
+                if !charge(budget, 1) {
+                    return None;
+                }
+                if !p.near(*q, 1e-4) {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
 }
 
-/// Remove degenerate and duplicate boundary loops within a shared comparison budget.
-/// Retain remaining loops without further comparisons once the budget is exhausted.
-fn dedup_polygons(loops: &mut Vec<Vec<Vec2>>) {
-    // `same_polygon` is O(n²) in a polygon's vertex count (every cyclic alignment, both windings),
-    // and each loop is compared against every unique one kept so far, so adversarial boundary
-    // geometry could force quadratic-on-quadratic work. Charge every vertex comparison against a
-    // shared budget; once it is spent, stop deduplicating and keep the remaining loops as-is
-    // (CWE-407).
-    let mut budget: u64 = MAX_DEDUP_COMPARISONS;
+/// Remove degenerate and duplicate loops, limiting both pair checks and vertex comparisons.
+fn dedup_polygons(loops: &mut Vec<Vec<Vec2>>, budget: Option<&HatchBudget>) -> Option<()> {
+    let mut remaining = MAX_DEDUP_COMPARISONS;
     let mut unique: Vec<Vec<Vec2>> = Vec::with_capacity(loops.len());
     for l in loops.drain(..) {
         if l.len() < 3 {
@@ -167,20 +181,21 @@ fn dedup_polygons(loops: &mut Vec<Vec<Vec2>>) {
         }
         let mut dup = false;
         for u in &unique {
+            if !charge(budget, 1) {
+                return None;
+            }
             if u.len() != l.len() {
                 continue;
             }
-            // Each `same_polygon` call costs about 2·len² comparisons; stop if that would overrun.
             let cost = 2u64.saturating_mul((u.len() as u64).saturating_mul(l.len() as u64));
-            match budget.checked_sub(cost) {
-                Some(left) => budget = left,
+            match remaining.checked_sub(cost) {
+                Some(left) => remaining = left,
                 None => {
-                    // Out of budget: keep `l` without further comparison.
-                    budget = 0;
+                    remaining = 0;
                     break;
                 }
             }
-            if same_polygon(u, &l) {
+            if same_polygon(u, &l, budget)? {
                 dup = true;
                 break;
             }
@@ -190,6 +205,7 @@ fn dedup_polygons(loops: &mut Vec<Vec<Vec2>>) {
         }
     }
     *loops = unique;
+    Some(())
 }
 
 /// Vertex comparisons `dedup_polygons` may perform before it stops deduplicating.
@@ -220,20 +236,19 @@ fn fill_loops_limited(h: &Hatch, tol: f64, budget: Option<&HatchBudget>) -> Opti
         }
     }
     let mut loops: Vec<Vec<Vec2>> = h.loops.iter().map(|l| Polyline { vertices: l.vertices.clone(), closed: true }.tessellate(tol)).collect();
-    let points = loops.iter().fold(0usize, |sum, l| sum.saturating_add(l.len()));
-    // Bound duplicate comparisons and island tests before either starts.
-    if loops.len() > 1 && !charge(budget, points.saturating_mul(points).saturating_mul(2)) {
-        return None;
-    }
-    dedup_polygons(&mut loops);
+    dedup_polygons(&mut loops, budget)?;
     let max_depth = match h.style {
         1 => 1,
         2 => 0,
         _ => return Some(loops),
     };
     let verts: usize = loops.iter().map(Vec::len).sum();
-    if loops.len().saturating_mul(verts) > MAX_ISLAND_WORK {
+    let island_work = loops.len().saturating_mul(verts);
+    if island_work > MAX_ISLAND_WORK {
         return Some(loops);
+    }
+    if !charge(budget, island_work) {
+        return None;
     }
     let depth = |i: usize, l: &[Vec2]| {
         let Some(p) = probe(l) else { return 0 };
@@ -720,6 +735,50 @@ mod tests {
     use cadcraft_geom::PolyVertex;
 
     #[test]
+    fn thumbnail_budget_preserves_a_multi_island_fill() {
+        let polygon = |cx: f64, cy: f64, radius: f64| HatchLoop {
+            vertices: (0..24)
+                .map(|i| {
+                    let angle = f64::from(i) * std::f64::consts::TAU / 24.0;
+                    PolyVertex::new(Vec2::new(cx + radius * angle.cos(), cy + radius * angle.sin()))
+                })
+                .collect(),
+            outer: false,
+            sources: vec![],
+        };
+        let mut boundaries = vec![polygon(0.0, 0.0, 100.0)];
+        boundaries.extend((0..20).map(|i| polygon(f64::from(i % 5) * 12.0 - 24.0, f64::from(i / 5) * 12.0 - 18.0, 3.0)));
+        let hatch = Hatch {
+            origin: Vec2::ZERO,
+            pattern: "SOLID".into(),
+            solid: true,
+            loops: boundaries,
+            scale: 1.0,
+            angle: 0.0,
+            associative: false,
+            style: 0,
+            elevation: 0.0,
+            gradient: None,
+            background: None,
+            pattern_lines: vec![],
+        };
+        let budget = HatchBudget::new(250_000);
+        let loops = fill_loops_limited(&hatch, 0.01, Some(&budget)).expect("ordinary islands fit the thumbnail budget");
+        assert_eq!(loops.len(), 21);
+        let tris = fill::triangulate_evenodd_limited(&loops, Some(&budget)).expect("fill fits the thumbnail budget");
+        assert!(!tris.is_empty());
+        assert!(budget.remaining() > 0);
+    }
+
+    #[test]
+    fn dedup_stops_when_the_shared_budget_is_exhausted() {
+        let mut loops = vec![vec![Vec2::ZERO; 100], vec![Vec2::new(1.0, 1.0); 100]];
+        let budget = HatchBudget::new(10);
+        assert!(dedup_polygons(&mut loops, Some(&budget)).is_none());
+        assert_eq!(budget.remaining(), 0);
+    }
+
+    #[test]
     fn fill_loops_deduplicates_coincident_loops() {
         let loop1 = HatchLoop {
             vertices: vec![
@@ -765,7 +824,7 @@ mod dedup_budget_tests {
         let b = vec![Vec2::ZERO; 5_001];
         let tri = vec![Vec2::ZERO, Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0)];
         let mut loops = vec![a, b, tri.clone(), tri];
-        dedup_polygons(&mut loops);
+        assert!(dedup_polygons(&mut loops, None).is_some());
         assert_eq!(loops.len(), 3);
     }
 }
