@@ -535,7 +535,8 @@ fn pattern_lines_limited(
             continue;
         }
         let dashes: Vec<f64> = fam.dashes.iter().map(|d| d * scale).collect();
-        Family { origin, ang, delta, spacing, dashes: &dashes }.sweep(loops, px, view, cancel, &mut out, &mut work, budget);
+        let mut sink = Sink { out: &mut out, work: &mut work, budget };
+        Family { origin, ang, delta, spacing, dashes: &dashes }.sweep(loops, px, view, cancel, &mut sink);
         if out.len() >= MAX_RUNS || work == 0 || is_set(cancel) {
             break;
         }
@@ -588,6 +589,14 @@ struct Family<'a> {
     dashes: &'a [f64],
 }
 
+/// Where a family sweep writes its runs, and the limits it spends while doing so: the per-build
+/// dash-work count and the optional shared thumbnail budget.
+struct Sink<'s> {
+    out: &'s mut Vec<Vec<Vec2>>,
+    work: &'s mut u64,
+    budget: Option<&'s HatchBudget>,
+}
+
 impl Family<'_> {
     /// Into the frame where the family's lines are horizontal.
     fn to_local(&self, p: Vec2) -> Vec2 {
@@ -618,16 +627,8 @@ impl Family<'_> {
     }
 
     /// Intersect a pattern family with boundary loops, respecting view, output, cancellation, and shared dash-work limits.
-    fn sweep(
-        &self,
-        loops: &[Vec<Vec2>],
-        px: f64,
-        view: Option<&Bounds2>,
-        cancel: Option<&AtomicBool>,
-        out: &mut Vec<Vec<Vec2>>,
-        work: &mut u64,
-        budget: Option<&HatchBudget>,
-    ) {
+    fn sweep(&self, loops: &[Vec<Vec2>], px: f64, view: Option<&Bounds2>, cancel: Option<&AtomicBool>, sink: &mut Sink<'_>) {
+        let budget = sink.budget;
         let points = loops.iter().fold(0usize, |n, l| n.saturating_add(l.len()));
         if !charge(budget, points.saturating_add(loops.len())) {
             return;
@@ -654,7 +655,7 @@ impl Family<'_> {
             if !charge(budget, points.saturating_mul(16).saturating_add(1)) {
                 return;
             }
-            if out.len() >= MAX_RUNS || *work == 0 || is_set(cancel) {
+            if sink.out.len() >= MAX_RUNS || *sink.work == 0 || is_set(cancel) {
                 return;
             }
             let y = k as f64 * self.spacing;
@@ -670,27 +671,27 @@ impl Family<'_> {
                     continue;
                 }
                 if solid_line {
-                    out.push(vec![self.to_world(Vec2::new(x0, y)), self.to_world(Vec2::new(x1, y))]);
+                    sink.out.push(vec![self.to_world(Vec2::new(x0, y)), self.to_world(Vec2::new(x1, y))]);
                 } else {
-                    self.dash((x0, x1), y, offset, pat_len, out, work, budget);
+                    self.dash((x0, x1), y, offset, pat_len, sink);
                 }
             }
         }
     }
 
     /// The dashes and dots of the span `x0..x1` of the line at `y`, phase anchored at x = `offset`.
-    fn dash(&self, (x0, x1): (f64, f64), y: f64, offset: f64, pat_len: f64, out: &mut Vec<Vec<Vec2>>, work: &mut u64, budget: Option<&HatchBudget>) {
+    fn dash(&self, (x0, x1): (f64, f64), y: f64, offset: f64, pat_len: f64, sink: &mut Sink<'_>) {
         let start_rep = ((x0 - offset) / pat_len).floor();
         let mut x = offset + start_rep * pat_len;
         let mut guard = 0;
         'outer: while x < x1 {
             for d in self.dashes {
-                if !charge(budget, 4) {
+                if !charge(sink.budget, 4) {
                     return;
                 }
                 guard += 1;
-                *work = work.saturating_sub(1);
-                if guard > 100_000 || out.len() >= MAX_RUNS || *work == 0 {
+                *sink.work = sink.work.saturating_sub(1);
+                if guard > 100_000 || sink.out.len() >= MAX_RUNS || *sink.work == 0 {
                     break 'outer;
                 }
                 let len = d.abs();
@@ -698,10 +699,10 @@ impl Family<'_> {
                     let a = x.max(x0);
                     let b = (x + len).min(x1);
                     if b > a {
-                        out.push(vec![self.to_world(Vec2::new(a, y)), self.to_world(Vec2::new(b, y))]);
+                        sink.out.push(vec![self.to_world(Vec2::new(a, y)), self.to_world(Vec2::new(b, y))]);
                     }
                 } else if *d == 0.0 && x >= x0 && x <= x1 {
-                    out.push(vec![self.to_world(Vec2::new(x, y))]);
+                    sink.out.push(vec![self.to_world(Vec2::new(x, y))]);
                 }
                 x += len;
                 if x >= x1 {

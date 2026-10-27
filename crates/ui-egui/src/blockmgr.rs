@@ -617,7 +617,14 @@ fn view(app: &CadApp, st: &mut State, cache: &mut PreviewCache) -> Option<View> 
     Some(View { all, selected, info, can_write: app.services.pick_save.is_some() })
 }
 
-/// Render a single block tile/row according to `st.view_mode`, updating `visible` and `cache`
+/// One frame's preview bookkeeping: the blocks seen in the scroll viewport (every other cached
+/// preview is evicted at the end of the frame) and how many uncached previews may still be built.
+struct FrameBuilds {
+    visible: HashSet<String>,
+    builds_left: usize,
+}
+
+/// Render a single block tile/row according to `st.view_mode`, updating `frame` and `cache`
 /// only when the tile is actually visible inside the scroll viewport.
 fn draw_block_item(
     ui: &mut egui::Ui,
@@ -626,19 +633,17 @@ fn draw_block_item(
     selected: bool,
     mode: ViewMode,
     tile_size: egui::Vec2,
-    cache: &mut PreviewCache,
-    visible: &mut HashSet<String>,
-    builds_left: &mut usize,
+    (cache, frame): (&mut PreviewCache, &mut FrameBuilds),
 ) -> egui::Response {
     let t = Tokens::get();
     let (rect, resp) = ui.allocate_exact_size(tile_size, Sense::click_and_drag());
     if !ui.is_rect_visible(rect) {
         return resp;
     }
-    visible.insert(name.to_string());
+    frame.visible.insert(name.to_string());
     if !cache.entries.contains_key(name) {
-        if *builds_left > 0 {
-            *builds_left -= 1;
+        if frame.builds_left > 0 {
+            frame.builds_left -= 1;
             if let Some((list, bounds)) = build(d, name) {
                 cache.entries.insert(name.to_string(), Preview { list: Arc::new(list), bounds });
             }
@@ -764,8 +769,7 @@ fn body(ui: &mut egui::Ui, d: &Drawing, v: &View, st: &mut State, cache: &mut Pr
     let list_h = (avail.y - bottom_reserve).clamp(140.0, 420.0);
     let list_w = avail.x;
 
-    let mut visible = HashSet::new();
-    let mut builds_left = MAX_BUILDS_PER_FRAME;
+    let mut frame = FrameBuilds { visible: HashSet::new(), builds_left: MAX_BUILDS_PER_FRAME };
 
     egui::Frame::NONE.stroke(Stroke::new(1.0, t.border)).inner_margin(4.0).show(ui, |ui| {
         egui::ScrollArea::vertical().id_salt("cc_block_list").auto_shrink([false, false]).max_height(list_h).show(ui, |ui| {
@@ -802,7 +806,7 @@ fn body(ui: &mut egui::Ui, d: &Drawing, v: &View, st: &mut State, cache: &mut Pr
                     ui.spacing_mut().item_spacing.y = 2.0;
                     for n in filtered {
                         let on = selected.as_deref() == Some(n.as_str());
-                        let r = draw_block_item(ui, d, n, on, ViewMode::List, vec2(inner_w, 28.0), cache, &mut visible, &mut builds_left);
+                        let r = draw_block_item(ui, d, n, on, ViewMode::List, vec2(inner_w, 28.0), (cache, &mut frame));
                         interact(n, r);
                     }
                 }
@@ -816,8 +820,7 @@ fn body(ui: &mut egui::Ui, d: &Drawing, v: &View, st: &mut State, cache: &mut Pr
                             ui.spacing_mut().item_spacing.x = gap;
                             for n in row {
                                 let on = selected.as_deref() == Some(n.as_str());
-                                let r =
-                                    draw_block_item(ui, d, n, on, ViewMode::MediumIcons, vec2(tile_w, tile_h), cache, &mut visible, &mut builds_left);
+                                let r = draw_block_item(ui, d, n, on, ViewMode::MediumIcons, vec2(tile_w, tile_h), (cache, &mut frame));
                                 interact(n, r);
                             }
                         });
@@ -834,8 +837,7 @@ fn body(ui: &mut egui::Ui, d: &Drawing, v: &View, st: &mut State, cache: &mut Pr
                             ui.spacing_mut().item_spacing.x = gap;
                             for n in row {
                                 let on = selected.as_deref() == Some(n.as_str());
-                                let r =
-                                    draw_block_item(ui, d, n, on, ViewMode::LargeIcons, vec2(tile_w, tile_h), cache, &mut visible, &mut builds_left);
+                                let r = draw_block_item(ui, d, n, on, ViewMode::LargeIcons, vec2(tile_w, tile_h), (cache, &mut frame));
                                 interact(n, r);
                             }
                         });
@@ -847,7 +849,7 @@ fn body(ui: &mut egui::Ui, d: &Drawing, v: &View, st: &mut State, cache: &mut Pr
     });
 
     // Unload every block preview that was not visible in the viewport this frame.
-    cache.retain_visible(&visible);
+    cache.retain_visible(&frame.visible);
 
     ui.add_space(4.0);
 

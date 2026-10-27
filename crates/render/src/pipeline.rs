@@ -2,8 +2,9 @@
 use super::display::append;
 use super::display::{DisplayList, Kind, NO_LAYER, PlotText, VIEWPORT_CONTENT};
 use super::draw::entity;
+use super::hatch::HatchBudget;
 use super::viewports::{MAX_VIEWPORTS, viewport};
-use super::*;
+use super::{Bounds2, Builder, Color, Ctx, Drawing, Entity, EntityKind, Handle, Lineweight, Mat3, Space, Vec2, paper, pen, plotstyle, point};
 
 /// Build options.
 #[derive(Clone, Debug)]
