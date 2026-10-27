@@ -191,6 +191,10 @@ pub fn reference_count(d: &Drawing, name: &str) -> usize {
 /// allowed when building a single palette thumbnail before returning an empty placeholder.
 const MAX_PREVIEW_BUDGET: usize = 8_192;
 
+/// Most points a single spline is sampled at while measuring or drawing a preview (the geometry
+/// crate's own cap); charged against the preview budget for every spline in a block.
+const SPLINE_PREVIEW_SAMPLES: usize = 4_000;
+
 /// Account for all attribute data cloned for bounds and processed by the renderer.
 fn preview_insert_cost(ins: &cadcraft_doc::Insert, remaining: usize) -> Option<usize> {
     let mut cost = 1usize.checked_add(ins.block.len())?.checked_add(ins.attribs.len())?;
@@ -254,6 +258,15 @@ fn preview_entity_cost(kind: &EntityKind, remaining: usize) -> Option<usize> {
                 }
             }
             cost
+        }
+        EntityKind::Spline(s) => {
+            // Charge the input arrays before bounds sampling clones/evaluates them, and the worst-case
+            // sampling (`geom` caps a spline at 4000 samples at any zoom) like other curved geometry.
+            let input = s.control.len().checked_add(s.fit.len())?.checked_add(s.knots.len())?.checked_add(s.weights.len())?;
+            if input > remaining {
+                return None;
+            }
+            1usize.checked_add(input)?.checked_add(SPLINE_PREVIEW_SAMPLES.div_ceil(8))?
         }
         EntityKind::Polyline3d(p) => 1usize.checked_add(p.points.len().checked_mul(2)?)?,
         EntityKind::Leader(l) => {
@@ -1483,6 +1496,25 @@ mod tests {
         let (list, bounds) = super::build(&d, "NormalWipeout").unwrap();
         assert!(!list.prims.is_empty());
         assert!(!bounds.is_empty());
+    }
+
+    /// Splines reserve their sampling work in the shared preview budget, so a block of many splines
+    /// gets the empty placeholder before any bounds sampling or tessellation runs.
+    #[test]
+    fn splines_are_charged_to_the_preview_budget() {
+        use cadcraft_doc::{Block, Drawing, Entity, Handle};
+        let spline = || EntityKind::Spline(cadcraft_geom::Spline::default());
+        let one = super::preview_entity_cost(&spline(), super::MAX_PREVIEW_BUDGET).unwrap_or(0);
+        assert!(one >= super::SPLINE_PREVIEW_SAMPLES / 8, "a spline must reserve its sampling work, got {one}");
+
+        let mut d = Drawing::default();
+        let mut block = Block::new("Splines");
+        for i in 0..64u64 {
+            block.entities.push(Entity::new(Handle(i + 1), spline()));
+        }
+        d.blocks.insert("Splines".into(), Arc::new(block));
+        let (list, bounds) = super::build(&d, "Splines").expect("block exists");
+        assert!(list.prims.is_empty() && bounds.is_empty(), "an over-budget block of splines must preview as an empty placeholder");
     }
 
     /// Preflight budget must account for array copies of blocks referenced by MLeaders.
