@@ -220,6 +220,29 @@ fn preview_insert_cost(ins: &cadcraft_doc::Insert, remaining: usize) -> Option<u
     Some(cost)
 }
 
+/// Charge loops, cloned input vertices and worst-case curve tessellation before bounds or rendering touch them.
+fn preview_hatch_cost(h: &cadcraft_doc::Hatch, remaining: usize) -> Option<usize> {
+    let mut cost = 1usize.checked_add(h.loops.len())?;
+    if cost > remaining {
+        return None;
+    }
+    for boundary in &h.loops {
+        cost = cost.checked_add(boundary.vertices.len())?;
+        if cost > remaining {
+            return None;
+        }
+        let mut points = 1usize;
+        for vertex in &boundary.vertices {
+            points = points.checked_add(if vertex.bulge == 0.0 { 2 } else { 4097 })?;
+        }
+        cost = cost.checked_add(points.div_ceil(8))?;
+        if cost > remaining {
+            return None;
+        }
+    }
+    Some(cost)
+}
+
 /// Charge polyline, wipeout and leader input before bounds traversal clones vertices, and reserve
 /// a conservative tessellation/triangulation cost before rendering. Curved segments can emit up
 /// to 4097 points at any zoom (`geom::arc_segments`); wide bands and wipeouts also emit triangles
@@ -241,29 +264,7 @@ fn preview_entity_cost(kind: &EntityKind, remaining: usize) -> Option<usize> {
             let output = points.checked_mul(if wide { 8 } else { 1 })?.div_ceil(8);
             1usize.checked_add(p.vertices.len())?.checked_add(output)?
         }
-        EntityKind::Hatch(h) => {
-            // Charge loops, cloned input vertices
-            // and worst-case curve tessellation before bounds or rendering touch them.
-            let mut cost = 1usize.checked_add(h.loops.len())?;
-            if cost > remaining {
-                return None;
-            }
-            for boundary in &h.loops {
-                cost = cost.checked_add(boundary.vertices.len())?;
-                if cost > remaining {
-                    return None;
-                }
-                let mut points = 1usize;
-                for vertex in &boundary.vertices {
-                    points = points.checked_add(if vertex.bulge == 0.0 { 2 } else { 4097 })?;
-                }
-                cost = cost.checked_add(points.div_ceil(8))?;
-                if cost > remaining {
-                    return None;
-                }
-            }
-            cost
-        }
+        EntityKind::Hatch(h) => preview_hatch_cost(h, remaining)?,
         EntityKind::Spline(s) => {
             // Charge the input arrays before bounds sampling clones/evaluates them, and the worst-case
             // sampling (`geom` caps a spline at 4000 samples at any zoom) like other curved geometry.
@@ -272,6 +273,27 @@ fn preview_entity_cost(kind: &EntityKind, remaining: usize) -> Option<usize> {
                 return None;
             }
             1usize.checked_add(input)?.checked_add(SPLINE_PREVIEW_SAMPLES.div_ceil(SPLINE_SAMPLES_PER_UNIT))?
+        }
+        EntityKind::Text(t) => {
+            let len = t.value.len().checked_add(t.style.len())?;
+            if len > remaining {
+                return None;
+            }
+            1usize.checked_add(len.div_ceil(16))?
+        }
+        EntityKind::MText(m) => {
+            let len = m.contents.len().checked_add(m.style.len())?;
+            if len > remaining {
+                return None;
+            }
+            1usize.checked_add(len.div_ceil(16))?
+        }
+        EntityKind::AttDef(a) => {
+            let len = a.tag.len().checked_add(a.prompt.len())?.checked_add(a.text.value.len())?.checked_add(a.text.style.len())?;
+            if len > remaining {
+                return None;
+            }
+            1usize.checked_add(len.div_ceil(16))?
         }
         EntityKind::Polyline3d(p) => 1usize.checked_add(p.points.len().checked_mul(2)?)?,
         EntityKind::Leader(l) => {
@@ -1215,6 +1237,10 @@ mod tests {
             app.ui.dialog = None;
             assert!(app.cmdline(&format!("{id} {{}}")).is_some());
             assert!(app.ui.dialog.is_none());
+            // Inline arguments (e.g. `insert Pin 10,20`) must not open the palette and lose arguments.
+            let _ = app.cmdline(&format!("{id} Pin 10,20"));
+            assert!(app.ui.dialog.is_none());
+            assert!(app.session.running.is_some());
         }
         let mut app = CadApp::new(Session::new(), Services::default());
         app.ui.blocks_window = true;
@@ -1501,6 +1527,68 @@ mod tests {
         let (list, bounds) = super::build(&d, "NormalWipeout").unwrap();
         assert!(!list.prims.is_empty());
         assert!(!bounds.is_empty());
+    }
+
+    /// Oversized text and MText payloads are bounded by preflight budget before text layout or shaping.
+    #[test]
+    fn oversized_text_previews_are_rejected_before_bounds_or_shaping() {
+        use cadcraft_doc::{Block, Drawing, Entity, Handle, MText, Text};
+        let mut d = Drawing::default();
+        let mut normal_blk = Block::new("NormalText");
+        normal_blk.entities.push(Entity::new(
+            Handle(1),
+            EntityKind::Text(Text {
+                insert: cadcraft_geom::Vec3::ZERO,
+                align_pt: None,
+                height: 2.5,
+                value: "ROOM 101".into(),
+                rotation: 0.0,
+                width_factor: 1.0,
+                oblique: 0.0,
+                style: "STANDARD".into(),
+                halign: Default::default(),
+                valign: Default::default(),
+            }),
+        ));
+        normal_blk.entities.push(Entity::new(
+            Handle(2),
+            EntityKind::MText(MText {
+                insert: cadcraft_geom::Vec3::ZERO,
+                height: 2.5,
+                width: 50.0,
+                attach: 1,
+                rotation: 0.0,
+                style: "STANDARD".into(),
+                contents: "Specification paragraph with details".into(),
+                line_spacing: 1.0,
+                line_spacing_exact: false,
+                columns: None,
+            }),
+        ));
+        d.blocks.insert("NormalText".into(), Arc::new(normal_blk));
+        let (list, bounds) = super::build(&d, "NormalText").expect("normal text previews");
+        assert!(!bounds.is_empty());
+        assert!(!list.prims.is_empty());
+
+        let mut oversized_blk = Block::new("OversizedText");
+        oversized_blk.entities.push(Entity::new(
+            Handle(3),
+            EntityKind::Text(Text {
+                insert: cadcraft_geom::Vec3::ZERO,
+                align_pt: None,
+                height: 2.5,
+                value: "A".repeat(super::MAX_PREVIEW_BUDGET + 10),
+                rotation: 0.0,
+                width_factor: 1.0,
+                oblique: 0.0,
+                style: "STANDARD".into(),
+                halign: Default::default(),
+                valign: Default::default(),
+            }),
+        ));
+        d.blocks.insert("OversizedText".into(), Arc::new(oversized_blk));
+        let (list, bounds) = super::build(&d, "OversizedText").expect("block entry exists");
+        assert!(bounds.is_empty() && list.prims.is_empty(), "oversized text payload must preview as an empty placeholder");
     }
 
     /// Splines reserve their sampling work in the shared preview budget: an ordinary block of splines

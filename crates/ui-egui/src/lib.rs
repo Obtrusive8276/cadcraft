@@ -402,9 +402,10 @@ impl CadApp {
     pub fn cmdline(&mut self, text: &str) -> Option<String> {
         if !self.session.prompting() {
             let first = text.split_whitespace().next().unwrap_or("");
-            // `cmd {json}` is a programmatic call: the engine runs it with those parameters.
-            let json_form = text.trim_start().get(first.len()..).is_some_and(|rest| rest.trim_start().starts_with('{'));
-            if !first.is_empty() && !json_form && menus::run_ui_command(self, &first.to_ascii_lowercase(), &Value::Null, true).is_some() {
+            let rest = text.trim_start().get(first.len()..).unwrap_or("").trim();
+            // A command typed alone without inline arguments runs UI-intercepted commands (like INSERT opening the palette).
+            // Inline arguments (text arguments or `{json}`) are left for the engine command line.
+            if !first.is_empty() && rest.is_empty() && menus::run_ui_command(self, &first.to_ascii_lowercase(), &Value::Null, true).is_some() {
                 return None;
             }
         }
