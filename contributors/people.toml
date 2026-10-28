@@ -91,7 +91,3 @@ sync_github_name = false
 real_name = "Robert Lee"
 sync_github_name = true
 
-
-[people.Obtrusive8276]
-display_name = "Nicopicks"
-sync_github_name = false
