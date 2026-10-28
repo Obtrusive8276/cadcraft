@@ -22,10 +22,12 @@ pub struct HatchBudget {
 }
 
 impl HatchBudget {
+    /// A budget allowing `work` units of hatch computation.
     pub fn new(work: usize) -> Self {
         Self { remaining: AtomicUsize::new(work) }
     }
 
+    /// Work units still available.
     pub fn remaining(&self) -> usize {
         self.remaining.load(Ordering::Relaxed)
     }
@@ -66,12 +68,12 @@ fn contours(b: &mut Builder, ctx: &Ctx, h: &Hatch, rgb: Ink, lw: f32, tol: f64) 
     }
 }
 
-/// Draw a hatch entity: `rgb` is its resolved colour, `tol` the chord tolerance.
 /// Whether a build's cancel flag has been set.
 fn is_set(cancel: Option<&AtomicBool>) -> bool {
     cancel.is_some_and(|c| c.load(Ordering::Relaxed))
 }
 
+/// Draw a hatch entity: `rgb` is its resolved colour, `tol` the chord tolerance.
 pub(super) fn draw(b: &mut Builder, ctx: &Ctx, e: &Entity, h: &Hatch, rgb: Ink, lw: f32, tol: f64) {
     let allowance = b.opts.hatch_budget.clone();
     let budget = allowance.as_deref();
@@ -220,6 +222,7 @@ pub fn fill_loops(h: &Hatch, tol: f64) -> Vec<Vec<Vec2>> {
     fill_loops_limited(h, tol, None).unwrap_or_default()
 }
 
+/// Fill loops for `h`, or `None` when `budget` runs out first.
 fn fill_loops_limited(h: &Hatch, tol: f64, budget: Option<&HatchBudget>) -> Option<Vec<Vec<Vec2>>> {
     if !charge(budget, h.loops.len()) {
         return None;
@@ -501,6 +504,7 @@ pub(crate) fn pattern_lines_until(
     pattern_lines_limited(d, h, loops, px, view, cancel, None)
 }
 
+/// Pattern lines for `h` clipped to `loops`, or `None` when the work budget runs out or `cancel` fires.
 fn pattern_lines_limited(
     d: &Drawing,
     h: &Hatch,

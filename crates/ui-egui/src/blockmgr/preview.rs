@@ -25,6 +25,7 @@ pub(super) enum PreviewFailure {
     MissingReference,
 }
 impl PreviewFailure {
+    /// The text shown in the palette for this refusal.
     pub(super) fn message(self) -> &'static str {
         match self {
             Self::Input => "Excessive preview input",
@@ -52,32 +53,40 @@ struct Budget {
     computation_steps: usize,
     vertices: usize,
 }
+/// Adds `b` to `a` with checked arithmetic, failing with `failure` on overflow or past `limit`.
 fn add(a: &mut usize, b: usize, limit: usize, failure: PreviewFailure) -> Checked<()> {
     *a = a.checked_add(b).filter(|v| *v <= limit).ok_or(failure)?;
     Ok(())
 }
 impl Budget {
+    /// Charges `n` input items.
     fn items(&mut self, n: usize) -> Checked<()> {
         add(&mut self.input_items, n, MAX_INPUT, PreviewFailure::Input)
     }
+    /// Charges `n` bytes of text.
     fn text(&mut self, n: usize) -> Checked<()> {
         add(&mut self.text_bytes, n, MAX_INPUT, PreviewFailure::Input)
     }
+    /// Charges `n` bytes of metadata (style names, column heights).
     fn meta(&mut self, n: usize) -> Checked<()> {
         if n > MAX_INPUT {
             return Err(PreviewFailure::Input);
         }
         add(&mut self.metadata_bytes, n, 1024 * 1024, PreviewFailure::Input)
     }
+    /// Charges `n` computation steps.
     fn work(&mut self, n: usize) -> Checked<()> {
         add(&mut self.computation_steps, n, MAX_WORK, PreviewFailure::Computation)
     }
+    /// Charges `n` output vertices.
     fn points(&mut self, n: usize) -> Checked<()> {
         add(&mut self.vertices, n, MAX_VERTICES, PreviewFailure::Output)
     }
+    /// Charges `n` expanded primitives.
     fn expand(&mut self, n: usize) -> Checked<()> {
         add(&mut self.expanded, n, MAX_PRIMITIVES, PreviewFailure::Computation)
     }
+    /// Multiplies what was charged since `before` by `copies`, as if the same content were repeated.
     fn copies(&mut self, before: Self, copies: usize) -> Checked<()> {
         let extra = copies.checked_sub(1).ok_or(PreviewFailure::Invalid)?;
         let delta = |after: usize, prior: usize| after.checked_sub(prior).and_then(|v| v.checked_mul(extra)).ok_or(PreviewFailure::Computation);
@@ -90,9 +99,11 @@ impl Budget {
         self.expand(delta(self.expanded, before.expanded)?)
     }
 }
+/// Fails with `Invalid` unless every value is finite.
 fn finite(values: impl IntoIterator<Item = f64>) -> Checked<()> {
     if values.into_iter().all(f64::is_finite) { Ok(()) } else { Err(PreviewFailure::Invalid) }
 }
+/// Charges the input size of an MText (contents, style, column metadata).
 fn mtext_input(m: &cadcraft_doc::MText, b: &mut Budget) -> Checked<()> {
     b.text(m.contents.len())?;
     b.meta(m.style.len())?;
@@ -103,6 +114,7 @@ fn mtext_input(m: &cadcraft_doc::MText, b: &mut Budget) -> Checked<()> {
     }
     finite([m.insert.x, m.insert.y, m.height, m.width, m.rotation])
 }
+/// Charges the input size of an INSERT (attributes and array metadata).
 fn insert_input(ins: &Insert, b: &mut Budget) -> Checked<()> {
     b.meta(ins.block.len())?;
     b.items(ins.attribs.len())?;
@@ -121,6 +133,7 @@ fn insert_input(ins: &Insert, b: &mut Budget) -> Checked<()> {
     }
     Ok(())
 }
+/// Charges the cost of a spline, following the geometry sampling plan at tolerance `tol`.
 fn spline_cost(s: &Spline, tol: Option<f64>, b: &mut Budget) -> Checked<()> {
     for n in [s.control.len(), s.fit.len(), s.knots.len(), s.weights.len()] {
         b.items(n)?;
@@ -154,6 +167,7 @@ fn spline_cost(s: &Spline, tol: Option<f64>, b: &mut Budget) -> Checked<()> {
     }
     Ok(())
 }
+/// Charges the cost of a polyline, counting arc and wide-segment expansion like the renderer.
 fn polyline_cost(vertices: &[cadcraft_geom::PolyVertex], closed: bool, wide: bool, tol: Option<f64>, b: &mut Budget) -> Checked<()> {
     b.items(vertices.len())?;
     finite(vertices.iter().flat_map(|v| [v.p.x, v.p.y, v.bulge, v.start_width, v.end_width]))?;
@@ -169,6 +183,7 @@ fn polyline_cost(vertices: &[cadcraft_geom::PolyVertex], closed: bool, wide: boo
     }
     Ok(())
 }
+/// Charges the input, computation and output cost of one entity before it is built.
 fn entity_cost(e: &Entity, tol: Option<f64>, b: &mut Budget) -> Checked<()> {
     b.expand(1)?;
     b.meta(e.common.layer.len())?;
@@ -334,6 +349,7 @@ fn entity_cost(e: &Entity, tol: Option<f64>, b: &mut Budget) -> Checked<()> {
     Ok(())
 }
 
+/// Charges the cost of a table: its cells, text and grid lines.
 fn table_cost(t: &cadcraft_doc::Table, tol: Option<f64>, b: &mut Budget) -> Checked<()> {
     b.items(t.row_heights.len())?;
     b.items(t.col_widths.len())?;
@@ -387,6 +403,7 @@ fn table_cost(t: &cadcraft_doc::Table, tol: Option<f64>, b: &mut Budget) -> Chec
     Ok(())
 }
 
+/// Charges the size of a JSON value, bounding its nesting at `depth`.
 fn json_input(value: &serde_json::Value, b: &mut Budget, depth: usize) -> Checked<()> {
     if depth >= cadcraft_doc::MAX_BLOCK_DEPTH {
         return Err(PreviewFailure::Input);
@@ -414,6 +431,7 @@ fn json_input(value: &serde_json::Value, b: &mut Budget, depth: usize) -> Checke
 
 // Each pass visits at most MAX_PRIMITIVES entities/copies, even without memoization. Arrays
 // measure one child then reserve the remaining copies' costs before any expansion happens.
+/// Bounds of block `name` including nested inserts; `stack` detects cycles and limits depth.
 fn preview_block_bounds(d: &Drawing, name: &str, stack: &mut Vec<String>, tol: Option<f64>, budget: &mut Budget) -> Checked<Bounds2> {
     if stack.len() >= cadcraft_doc::MAX_BLOCK_DEPTH || stack.iter().any(|n| n.eq_ignore_ascii_case(name)) {
         return Err(PreviewFailure::Computation);
@@ -469,6 +487,7 @@ fn preview_block_bounds(d: &Drawing, name: &str, stack: &mut Vec<String>, tol: O
     stack.pop();
     Ok(bounds)
 }
+/// Bounds of one INSERT, covering every copy of an array.
 fn insert_bounds(d: &Drawing, i: &Insert, stack: &mut Vec<String>, tol: Option<f64>, b: &mut Budget) -> Checked<Bounds2> {
     let copies = (i.cols.max(1) as usize).checked_mul(i.rows.max(1) as usize).ok_or(PreviewFailure::Computation)?;
     b.expand(copies)?;
@@ -502,12 +521,14 @@ fn insert_bounds(d: &Drawing, i: &Insert, stack: &mut Vec<String>, tol: Option<f
     Ok(bounds)
 }
 
+/// Builds the preview of block `name`; never panics, refusals are returned as `Unavailable`.
 pub(super) fn build(d: &Drawing, name: &str) -> PreviewResult {
     match build_checked(d, name) {
         Ok(v) => v,
         Err(e) => PreviewResult::Unavailable(e),
     }
 }
+/// The fallible body of [`build`].
 fn build_checked(d: &Drawing, name: &str) -> Checked<PreviewResult> {
     let block = d.block(name).ok_or(PreviewFailure::MissingReference)?;
     let mut budget = Budget::default();

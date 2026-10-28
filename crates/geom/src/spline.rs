@@ -190,11 +190,13 @@ impl Spline {
         }
     }
 
+    /// Segments for the parameter span `a..b`: a share of `budget` proportional to its width, never below `floor` nor above `MAX_SAMPLES`.
     fn span_segments(&self, budget: usize, floor: usize, a: f64, b: f64) -> usize {
         let (lo, hi) = self.domain();
         floor.max((budget as f64 * ((b - a) / (hi - lo))) as usize).min(MAX_SAMPLES)
     }
 
+    /// The sampling plan used to bound the curve, matching the one the renderer draws.
     fn bounds_sampling(&self) -> BoundsSampling {
         let hull = Bounds2::from_points(self.control.iter().copied());
         let diag = hull.min.dist(hull.max);

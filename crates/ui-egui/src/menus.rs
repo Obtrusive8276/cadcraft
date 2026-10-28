@@ -86,6 +86,7 @@ pub fn run_ui_command(app: &mut CadApp, id: &str, params: &Value, interactive: b
     crate::i18n::with_language(app.language(), || run_ui_command_inner(app, id, params, interactive))
 }
 
+/// Routes `id` to the UI-only subsystems; `None` when none of them handles it.
 fn route_ui_subsystems(app: &mut CadApp, id: &str, params: &Value, interactive: bool) -> Option<Result<Value, String>> {
     if let Some(result) = crate::spacemouse::route(app, id, params) {
         return Some(result);
@@ -298,6 +299,7 @@ fn should_pick_file_path(id: &str, params: &Value) -> bool {
     if id.starts_with("ui.") { params.is_null() || (params.get("path").is_none() && params.get("data").is_none()) } else { params.is_null() }
 }
 
+/// Runs the UI-only command `id`, or returns `None` so the engine handles it.
 fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value, interactive: bool) -> Option<Result<Value, String>> {
     if let Some(result) = route_ui_subsystems(app, id, params, interactive) {
         return Some(result);

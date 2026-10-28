@@ -231,6 +231,7 @@ pub fn build_entities_limited<'a, I: IntoIterator<Item = &'a Entity>>(
     (!failed).then_some(list)
 }
 
+/// Builds the render list for `entities`, or `None` when the hatch work budget is exhausted.
 fn build_entities_with_limit<'a, I: IntoIterator<Item = &'a Entity>>(
     d: &Drawing,
     ents: I,

@@ -189,6 +189,7 @@ impl PreviewCache {
         }
     }
 
+    /// Caches `result` under `name` (an oversized one becomes a small refusal), then evicts beyond the limits.
     fn insert(&mut self, name: String, mut result: PreviewResult, visible: &HashSet<String>) {
         let mut bytes = retained_bytes(&result).and_then(|v| v.checked_add(name.capacity()));
         // Cache a small refusal instead of rebuilding a result that can never fit.
@@ -207,6 +208,7 @@ impl PreviewCache {
         self.entries.values().try_fold(self.entries.capacity().checked_mul(slots)?, |sum, e| sum.checked_add(e.bytes))
     }
 
+    /// Drops least-recently-used entries until the count and byte limits hold, sparing `visible` names while possible.
     fn evict(&mut self, visible: &HashSet<String>) {
         while self.entries.len() > MAX_CACHE_RESULTS || self.estimated_bytes().is_none_or(|v| v > MAX_CACHE_BYTES) {
             let victim = self.entries.iter().min_by_key(|(name, e)| (visible.contains(*name), e.used)).map(|(name, _)| name.clone());
@@ -508,6 +510,7 @@ fn draw_block_item(
     }
 }
 
+/// Short text explaining why a block shows no drawing, or `None` when it has a preview.
 fn preview_status(result: Option<&PreviewResult>, empty_definition: bool) -> Option<&'static str> {
     match result {
         None => Some(crate::tl!("Preview pending")),
@@ -518,6 +521,7 @@ fn preview_status(result: Option<&PreviewResult>, empty_definition: bool) -> Opt
     }
 }
 
+/// Paints the preview, or the `status` text in `rect` when there is none (`compact` shows a one-character marker instead).
 fn paint_preview(p: &egui::Painter, rect: Rect, result: Option<&PreviewResult>, status: &Option<&'static str>, compact: bool) {
     if let Some(PreviewResult::Ready(pv)) = result {
         paint_list(p, rect, &pv.list, &pv.bounds);
