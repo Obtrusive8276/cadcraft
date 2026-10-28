@@ -283,10 +283,11 @@ fn preview_entity_cost(kind: &EntityKind, remaining: usize) -> Option<usize> {
         }
         EntityKind::MText(m) => {
             let len = m.contents.len().checked_add(m.style.len())?;
-            if len > remaining {
+            let heights = m.columns.as_ref().map_or(0, |columns| columns.heights.len());
+            if len.checked_add(heights)? > remaining {
                 return None;
             }
-            1usize.checked_add(len.div_ceil(16))?
+            1usize.checked_add(len.div_ceil(16))?.checked_add(heights)?
         }
         EntityKind::AttDef(a) => {
             let len = a.tag.len().checked_add(a.prompt.len())?.checked_add(a.text.value.len())?.checked_add(a.text.style.len())?;
@@ -1589,6 +1590,28 @@ mod tests {
         d.blocks.insert("OversizedText".into(), Arc::new(oversized_blk));
         let (list, bounds) = super::build(&d, "OversizedText").expect("block entry exists");
         assert!(bounds.is_empty() && list.prims.is_empty(), "oversized text payload must preview as an empty placeholder");
+
+        let mut mtext = MText {
+            insert: cadcraft_geom::Vec3::ZERO,
+            height: 2.5,
+            width: 50.0,
+            attach: 1,
+            rotation: 0.0,
+            style: "STANDARD".into(),
+            contents: "A".into(),
+            line_spacing: 1.0,
+            line_spacing_exact: false,
+            columns: Some(cadcraft_doc::MTextColumns {
+                kind: cadcraft_doc::MTextColumnType::Dynamic,
+                auto_height: false,
+                heights: vec![1.0; super::MAX_PREVIEW_BUDGET + 1],
+                ..Default::default()
+            }),
+        };
+        assert!(super::preview_entity_cost(&EntityKind::MText(mtext.clone()), super::MAX_PREVIEW_BUDGET).is_none());
+        mtext.columns = None;
+        mtext.contents = "A".repeat(super::MAX_PREVIEW_BUDGET + 1);
+        assert!(super::preview_entity_cost(&EntityKind::MText(mtext), super::MAX_PREVIEW_BUDGET).is_none());
     }
 
     /// Splines reserve their sampling work in the shared preview budget: an ordinary block of splines
