@@ -1,6 +1,6 @@
 # UI parity
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-25 · **Change:** minor (Blocks palette dispatch, metadata cache and hatch preview guard) · **Target:** Autodesk AutoCAD 2027 for Mac (26.0)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-28 · **Change:** minor (bounded reusable block previews with explicit refusal reasons) · **Target:** Autodesk AutoCAD 2027 for Mac (26.0)
 
 How CADCraft's interaction compares with AutoCAD's: point entry, object snaps, tracking, dynamic
 input, grips, selection, the command line, chrome and navigation. A drafter's speed in AutoCAD
@@ -161,7 +161,7 @@ down-arrow options menu (DYNPROMPT), and DYNDIM.
 | Tool Sets palette (Drafting, Modeling, … with flyouts) | yes | yes for 2D groups |
 | Properties Inspector, Quick Properties | yes | yes (every control acts or is visibly unavailable, #182); block references show read-only Position X/Y/Z from their stored insertion point; coordinate editing is still missing |
 | Layer Properties Manager (filters, states, VP overrides) | yes | yes |
-| Blocks palette, Content | yes | Docked/floating Blocks palette with list and icon views, click/drag insertion and repeat placement (#2122). Escape outside placement preserves the repeat preference; double-click starts insertion once. Clicks on disappearing canvas menus do not place blocks; batched clicks also exclude visible ViewCube/WCS and UCS icon targets. Programmatic INSERT stays in the engine; block names and reference counts are cached by drawing/revision/selection. Hatch thumbnails keep fills and patterns within a per-thumbnail work budget and fall back to bounded contours when it is exhausted. Oversized polyline/hatch boundaries use empty placeholders before bounds/rendering. Other geometry still relies on renderer limits. |
+| Blocks palette, Content | yes | Docked/floating Blocks palette with list and icon views, click/drag insertion and repeat placement (#2122). Escape outside placement preserves the repeat preference; double-click starts insertion once. Clicks on disappearing canvas menus do not place blocks; batched clicks also exclude visible ViewCube/WCS and UCS icon targets. Programmatic INSERT stays in the engine; block names and reference counts are cached by drawing/revision/selection. Hatch thumbnails retain fills and patterns within a shared work allowance; exhaustion reports an unavailable thumbnail rather than accepting partial contours. Thumbnail preflight separates input, curve/expansion work and retained output; spline and polyline estimates follow geometry sampling at thumbnail tolerance. A 64 MiB / 512-result LRU retains off-screen previews and refusals. Pending, empty, invisible and unavailable states are distinct, with a translated refusal reason on hover. Insertion is independent of preview success. Builds remain synchronous: the elapsed-time check only defers the next build. See [validation](block-preview-validation.md). |
 | Status bar toggles | ~25 | most toggles; Annotation Visibility and Workspace do nothing |
 | ViewCube | interactive 3D | clickable for 2D (Top/Home → extents); dragging does nothing (#7) |
 | Navigation bar, SteeringWheels | yes | no |
@@ -223,3 +223,4 @@ down-arrow options menu (DYNPROMPT), and DYNDIM.
 | 2026-10-11 | minor | Object snap tracking, Extension, Parallel, Apparent Intersection, additional polar angles (#379): tracking 30% → 70%, object snaps 40% → 45%; total 43% → 48% |
 | 2026-10-10 | minor | Dynamic input 15% → 45% (pointer boxes, #60); press-drag windows (#63); total 40% → 43% |
 | 2026-10-10 | major | First UI-parity audit: point entry, snaps, tracking, dynamic input, grips, selection, command line, chrome, navigation, keys |
+| 2026-10-28 | minor | Blocks palette: tolerance-based preflight, explicit failures, renderer output reservations and bounded LRU; 364 local library blocks audited, with visual checks and release measurements in [block-preview-validation.md](block-preview-validation.md) |

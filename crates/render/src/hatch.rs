@@ -57,10 +57,11 @@ fn contours(b: &mut Builder, ctx: &Ctx, h: &Hatch, rgb: Ink, lw: f32, tol: f64) 
         if boundary.vertices.len() > 8192 || b.opts.cancelled() {
             return;
         }
-        let cost = boundary.vertices.iter().try_fold(1usize, |sum, v| sum.checked_add(if v.bulge == 0.0 { 2 } else { 4097 }));
+        let poly = Polyline { vertices: boundary.vertices.clone(), closed: true };
+        let cost = poly.tessellation_points(tol);
         let Some(next) = cost.and_then(|cost| left.checked_sub(cost)) else { return };
         left = next;
-        let points = Polyline { vertices: boundary.vertices.clone(), closed: true }.tessellate(tol);
+        let points = poly.tessellate(tol);
         b.polyline(ctx, rgb, lw, &points);
     }
 }
@@ -228,10 +229,9 @@ fn fill_loops_limited(h: &Hatch, tol: f64, budget: Option<&HatchBudget>) -> Opti
             if !charge(budget, boundary.vertices.len()) {
                 return None;
             }
-            for vertex in &boundary.vertices {
-                if !charge(budget, if vertex.bulge == 0.0 { 2 } else { 4097 }) {
-                    return None;
-                }
+            let poly = Polyline { vertices: boundary.vertices.clone(), closed: true };
+            if !poly.tessellation_points(tol).is_some_and(|n| charge(budget, n)) {
+                return None;
             }
         }
     }

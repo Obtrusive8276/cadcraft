@@ -1,6 +1,6 @@
 //! The Block Manager / Blocks palette: displays the drawing's blocks as a list, medium icons or
-//! large icons (with a slider and view-mode menu), keeps only visible block previews in memory
-//! (unloading off-screen blocks each frame), lets the user grab a block by clicking or dragging it
+//! large icons (with a slider and view-mode menu), reuses previews in a bounded LRU cache,
+//! lets the user grab a block by clicking or dragging it
 //! onto the drawing to place with a single click, and keeps all block editing actions.
 
 use std::collections::{HashMap, HashSet};
@@ -114,18 +114,52 @@ struct Preview {
     bounds: Bounds2,
 }
 
-/// Previews of the blocks currently visible in the viewport for `(drawing_uid, revision)`.
-/// Any block that leaves the visible viewport is evicted at the end of the frame.
+/// Bounded LRU of complete results (including refusals) for `(drawing_uid, revision)`.
+/// Off-screen entries are preferred eviction candidates; visibility never bypasses the caps.
 #[derive(Clone, Default)]
 pub struct PreviewCache {
     key: (u64, u64),
-    entries: HashMap<String, Preview>,
+    entries: HashMap<String, CacheEntry>,
+    clock: u64,
     names: Option<Arc<Vec<String>>>,
     references: Option<(String, usize)>,
 }
 
-/// Maximum number of uncached visible block previews built in a single UI frame so scrolling a
-/// large block library never stalls the frame rate.
+#[derive(Clone)]
+struct CacheEntry {
+    result: PreviewResult,
+    used: u64,
+    bytes: usize,
+}
+const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CACHE_RESULTS: usize = 512;
+// Leave room for hash-table growth when the 513th result triggers eviction.
+const MAX_ENTRY_BYTES: usize = MAX_CACHE_BYTES - 2 * (MAX_CACHE_RESULTS + 1) * (std::mem::size_of::<(String, CacheEntry)>() + 16);
+
+/// Count capacities, not lengths. Thumbnail lists never own plotted glyph/font data.
+fn retained_bytes(result: &PreviewResult) -> Option<usize> {
+    let mut bytes = std::mem::size_of::<CacheEntry>();
+    if let PreviewResult::Ready(p) = result {
+        let list = &p.list;
+        if !list.texts.is_empty() {
+            return None;
+        }
+        bytes = bytes.checked_add(std::mem::size_of::<cadcraft_render::DisplayList>() + 2 * std::mem::size_of::<usize>())?;
+        for (capacity, size) in [
+            (list.prims.capacity(), std::mem::size_of::<cadcraft_render::DPrim>()),
+            (list.verts.capacity(), std::mem::size_of::<Vec2>()),
+            (list.tris.capacity(), std::mem::size_of::<Vec2>()),
+            (list.prim_layers.capacity(), std::mem::size_of::<u32>()),
+            (list.texts.capacity(), std::mem::size_of::<cadcraft_render::PlotText>()),
+            (list.pens.capacity(), std::mem::size_of::<cadcraft_render::pen::Pen>()),
+        ] {
+            bytes = bytes.checked_add(capacity.checked_mul(size)?)?;
+        }
+    }
+    Some(bytes)
+}
+
+/// At most three synchronous builds start per frame. An individual build can still stall a frame.
 const MAX_BUILDS_PER_FRAME: usize = 3;
 
 impl PreviewCache {
@@ -139,9 +173,46 @@ impl PreviewCache {
         }
     }
 
-    /// Drop every cached preview that was not visible on screen during this frame.
-    pub fn retain_visible(&mut self, visible: &HashSet<String>) {
-        self.entries.retain(|name, _| visible.contains(name));
+    /// Touch a result without rebuilding it, even when it has no geometry.
+    fn touch(&mut self, name: &str) {
+        self.clock = match self.clock.checked_add(1) {
+            Some(v) => v,
+            None => {
+                for entry in self.entries.values_mut() {
+                    entry.used = 0;
+                }
+                1
+            }
+        };
+        if let Some(entry) = self.entries.get_mut(name) {
+            entry.used = self.clock;
+        }
+    }
+
+    fn insert(&mut self, name: String, mut result: PreviewResult, visible: &HashSet<String>) {
+        let mut bytes = retained_bytes(&result).and_then(|v| v.checked_add(name.capacity()));
+        // Cache a small refusal instead of rebuilding a result that can never fit.
+        if bytes.is_none_or(|v| v > MAX_ENTRY_BYTES) {
+            result = PreviewResult::Unavailable(PreviewFailure::Output);
+            bytes = std::mem::size_of::<CacheEntry>().checked_add(name.capacity());
+        }
+        self.entries.insert(name.clone(), CacheEntry { result, used: 0, bytes: bytes.unwrap_or(MAX_CACHE_BYTES) });
+        self.touch(&name);
+        self.evict(visible);
+    }
+
+    /// Conservative retained allocation estimate, including hash capacity and owned key buffers.
+    fn estimated_bytes(&self) -> Option<usize> {
+        let slots = std::mem::size_of::<(String, CacheEntry)>().checked_add(16)?;
+        self.entries.values().try_fold(self.entries.capacity().checked_mul(slots)?, |sum, e| sum.checked_add(e.bytes))
+    }
+
+    fn evict(&mut self, visible: &HashSet<String>) {
+        while self.entries.len() > MAX_CACHE_RESULTS || self.estimated_bytes().is_none_or(|v| v > MAX_CACHE_BYTES) {
+            let victim = self.entries.iter().min_by_key(|(name, e)| (visible.contains(*name), e.used)).map(|(name, _)| name.clone());
+            let Some(victim) = victim else { break };
+            self.entries.remove(&victim);
+        }
     }
 
     /// Number of block previews currently held in memory.
@@ -187,311 +258,8 @@ pub fn reference_count(d: &Drawing, name: &str) -> usize {
         .count()
 }
 
-/// Maximum work units (visited entities and expanded block references) and output primitives/vertices
-/// allowed when building a single palette thumbnail before returning an empty placeholder.
-const MAX_PREVIEW_BUDGET: usize = 32_768;
-
-/// A separate limit for the completed display list. Preflight and output measure different work;
-/// charging both against the same remainder rejects modest, detailed blocks twice.
-const MAX_PREVIEW_OUTPUT: usize = 32_768;
-
-/// Most points a single spline is sampled at while measuring or drawing a preview (the geometry
-/// crate's own cap); charged against the preview budget for every spline in a block.
-const SPLINE_PREVIEW_SAMPLES: usize = 4_000;
-
-/// Sampled spline points covered by one budget unit. A preview samples at a tolerance of a pixel
-/// or so, far below the 4000-point cap, so the worst case is charged at 1/32 (about 125 units a
-/// spline): ordinary blocks with dozens of splines preview, thousands are refused.
-const SPLINE_SAMPLES_PER_UNIT: usize = 32;
-
-/// Account for all attribute data cloned for bounds and processed by the renderer.
-fn preview_insert_cost(ins: &cadcraft_doc::Insert, remaining: usize) -> Option<usize> {
-    let mut cost = 1usize.checked_add(ins.block.len())?.checked_add(ins.attribs.len())?;
-    if cost > remaining {
-        return None;
-    }
-    for a in &ins.attribs {
-        cost = cost.checked_add(a.tag.len())?.checked_add(a.prompt.len())?.checked_add(a.text.value.len())?.checked_add(a.text.style.len())?;
-        cost = cost.checked_add(a.props.layer.as_ref().map_or(0, String::len))?.checked_add(a.props.linetype.as_ref().map_or(0, String::len))?;
-        if let Some(m) = &a.multiline {
-            cost = cost.checked_add(m.read_as.len())?.checked_add(m.mtext.contents.len())?.checked_add(m.mtext.style.len())?;
-            cost = cost.checked_add(m.mtext.columns.as_ref().map_or(0, |c| c.heights.len()))?;
-        }
-        if cost > remaining {
-            return None;
-        }
-    }
-    Some(cost)
-}
-
-/// Charge loops, cloned input vertices and worst-case curve tessellation before bounds or rendering touch them.
-fn preview_hatch_cost(h: &cadcraft_doc::Hatch, remaining: usize) -> Option<usize> {
-    let mut cost = 1usize.checked_add(h.loops.len())?;
-    if cost > remaining {
-        return None;
-    }
-    for boundary in &h.loops {
-        cost = cost.checked_add(boundary.vertices.len())?;
-        if cost > remaining {
-            return None;
-        }
-        let mut points = 1usize;
-        for vertex in &boundary.vertices {
-            points = points.checked_add(if vertex.bulge == 0.0 { 2 } else { 4097 })?;
-        }
-        cost = cost.checked_add(points.div_ceil(8))?;
-        if cost > remaining {
-            return None;
-        }
-    }
-    Some(cost)
-}
-
-/// Charge polyline, wipeout and leader input before bounds traversal clones vertices, and reserve
-/// a conservative tessellation/triangulation cost before rendering. Curved segments can emit up
-/// to 4097 points at any zoom (`geom::arc_segments`); wide bands and wipeouts also emit triangles
-/// and a boundary line. Counting these in the shared block budget covers nested references and
-/// arrays, not just top-level entities.
-fn preview_entity_cost(kind: &EntityKind, remaining: usize) -> Option<usize> {
-    let cost = match kind {
-        EntityKind::Insert(ins) => preview_insert_cost(ins, remaining)?,
-        EntityKind::LwPolyline(p) => {
-            if p.vertices.len() > remaining {
-                return None;
-            }
-            let wide = p.const_width > 0.0 || p.vertices.iter().any(|v| v.start_width > 0.0 || v.end_width > 0.0);
-            let segments = if p.closed { p.vertices.len() } else { p.vertices.len().saturating_sub(1) };
-            let mut points = 0usize;
-            for v in p.vertices.iter().take(segments) {
-                points = points.checked_add(if v.bulge == 0.0 { 2 } else { 4097 })?;
-            }
-            let output = points.checked_mul(if wide { 8 } else { 1 })?.div_ceil(8);
-            1usize.checked_add(p.vertices.len())?.checked_add(output)?
-        }
-        EntityKind::Hatch(h) => preview_hatch_cost(h, remaining)?,
-        EntityKind::Spline(s) => {
-            // Charge the input arrays before bounds sampling clones/evaluates them, and the worst-case
-            // sampling (`geom` caps a spline at 4000 samples at any zoom) like other curved geometry.
-            let input = s.control.len().checked_add(s.fit.len())?.checked_add(s.knots.len())?.checked_add(s.weights.len())?;
-            if input > remaining {
-                return None;
-            }
-            1usize.checked_add(input)?.checked_add(SPLINE_PREVIEW_SAMPLES.div_ceil(SPLINE_SAMPLES_PER_UNIT))?
-        }
-        EntityKind::Text(t) => {
-            let len = t.value.len().checked_add(t.style.len())?;
-            if len > remaining {
-                return None;
-            }
-            1usize.checked_add(len.div_ceil(16))?
-        }
-        EntityKind::MText(m) => {
-            let len = m.contents.len().checked_add(m.style.len())?;
-            let heights = m.columns.as_ref().map_or(0, |columns| columns.heights.len());
-            if len.checked_add(heights)? > remaining {
-                return None;
-            }
-            1usize.checked_add(len.div_ceil(16))?.checked_add(heights)?
-        }
-        EntityKind::AttDef(a) => {
-            let len = a.tag.len().checked_add(a.prompt.len())?.checked_add(a.text.value.len())?.checked_add(a.text.style.len())?;
-            if len > remaining {
-                return None;
-            }
-            1usize.checked_add(len.div_ceil(16))?
-        }
-        EntityKind::Polyline3d(p) => 1usize.checked_add(p.points.len().checked_mul(2)?)?,
-        EntityKind::Leader(l) => {
-            if l.vertices.len() > remaining {
-                return None;
-            }
-            let arrow_cost = if l.arrow && l.vertices.len() >= 2 { 8 } else { 0 };
-            let output = l.vertices.len().div_ceil(8).checked_add(arrow_cost)?;
-            1usize.checked_add(l.vertices.len())?.checked_add(output)?
-        }
-        EntityKind::Wipeout(w) => {
-            if w.boundary.len() > remaining {
-                return None;
-            }
-            let output = w.boundary.len().checked_mul(4)?.div_ceil(8);
-            1usize.checked_add(w.boundary.len())?.checked_add(output)?
-        }
-        EntityKind::MLeader(m) => {
-            let leaders = m.leaders.iter().try_fold(0usize, |cost, line| {
-                let points = line.len().checked_add(1)?;
-                let rendered_points = if m.spline && points > 2 { 4_000 } else { points };
-                cost.checked_add(points)?.checked_add(rendered_points.div_ceil(8))
-            })?;
-            let text = m.text.as_ref().map_or(0, |t| t.contents.len());
-            let block = match &m.block {
-                Some(ins) => preview_insert_cost(ins, remaining)?,
-                None => 0,
-            };
-            1usize.checked_add(leaders)?.checked_add(text)?.checked_add(block)?
-        }
-        _ => 1,
-    };
-    (cost <= remaining).then_some(cost)
-}
-
-/// Compute the bounds and expanded entity cost of `block_name` using a shared `budget` and shared
-/// `(block_name, depth)` memoization table across all root and nested references. Returns `None`
-/// when the block is missing or the preview budget is exhausted.
-fn preview_block_bounds(
-    d: &Drawing,
-    block_name: &str,
-    depth: usize,
-    budget: &mut usize,
-    memo: &mut HashMap<(String, usize), (Bounds2, usize)>,
-) -> Option<(Bounds2, usize)> {
-    if depth >= cadcraft_doc::MAX_BLOCK_DEPTH {
-        return Some((Bounds2::EMPTY, 0));
-    }
-    let key = (block_name.to_ascii_lowercase(), depth);
-    if let Some(&(bounds, cost)) = memo.get(&key) {
-        *budget = budget.checked_sub(cost)?;
-        return Some((bounds, cost));
-    }
-    let b = d.block(block_name)?;
-    let mut bounds = Bounds2::EMPTY;
-    let mut total_cost = 0usize;
-    for e in b.entities.iter() {
-        let cost = preview_entity_cost(&e.kind, *budget)?;
-        *budget = budget.checked_sub(cost)?;
-        total_cost = total_cost.checked_add(cost)?;
-        let eb = match &e.kind {
-            EntityKind::Insert(ins) => {
-                let copies = (ins.cols.max(1) as usize).saturating_mul(ins.rows.max(1) as usize);
-                if copies > *budget {
-                    return None;
-                }
-                let (inner, child_cost) =
-                    if d.block(&ins.block).is_some() { preview_block_bounds(d, &ins.block, depth + 1, budget, memo)? } else { (Bounds2::EMPTY, 0) };
-                let extra_copies = copies.saturating_sub(1).saturating_mul(child_cost.saturating_add(1));
-                *budget = budget.checked_sub(extra_copies)?;
-                total_cost = total_cost.saturating_add(child_cost).saturating_add(extra_copies);
-                let mut ib = if inner.is_empty() {
-                    Bounds2::EMPTY
-                } else {
-                    let base = d.block(&ins.block).map_or(Vec2::ZERO, |blk| blk.base.xy());
-                    let m = ins.transform(base);
-                    let mut b0 = Bounds2::from_points(inner.corners().map(|c| m.apply(c)));
-                    if ins.cols > 1 || ins.rows > 1 {
-                        let off = Vec2::new(
-                            ins.col_spacing * f64::from(ins.cols.saturating_sub(1)),
-                            ins.row_spacing * f64::from(ins.rows.saturating_sub(1)),
-                        )
-                        .rotate(ins.rotation);
-                        b0 = b0.union(&Bounds2::from_points(b0.corners().map(|c| c + off)));
-                    }
-                    b0
-                };
-                if !ins.attribs.is_empty() {
-                    let mut attr_only = ins.clone();
-                    attr_only.block.clear();
-                    let ae = cadcraft_doc::Entity { handle: e.handle, common: e.common.clone(), kind: EntityKind::Insert(attr_only) };
-                    ib = ib.union(&cadcraft_doc::entity_bounds(d, &ae, depth));
-                }
-                ib
-            }
-            EntityKind::Dimension(dm) => {
-                if let Some(ref dim_blk) = dm.block
-                    && d.block(dim_blk).is_some()
-                {
-                    let (_, child_cost) = preview_block_bounds(d, dim_blk, depth + 1, budget, memo)?;
-                    total_cost = total_cost.saturating_add(child_cost);
-                }
-                let mut no_blk = dm.clone();
-                no_blk.block = None;
-                let de = cadcraft_doc::Entity { handle: e.handle, common: e.common.clone(), kind: EntityKind::Dimension(no_blk) };
-                let mut db = cadcraft_doc::entity_bounds(d, &de, depth);
-                if let Some(ref dim_blk) = dm.block
-                    && let Some(&(inner, _)) = memo.get(&(dim_blk.to_ascii_lowercase(), depth + 1))
-                {
-                    db = db.union(&inner);
-                }
-                db
-            }
-            EntityKind::MLeader(ml) => {
-                let mut mb = Bounds2::EMPTY;
-                if let Some(ref ins) = ml.block {
-                    let copies = (ins.cols.max(1) as usize).saturating_mul(ins.rows.max(1) as usize);
-                    if copies > *budget {
-                        return None;
-                    }
-                    let (inner, child_cost) = if d.block(&ins.block).is_some() {
-                        preview_block_bounds(d, &ins.block, depth + 1, budget, memo)?
-                    } else {
-                        (Bounds2::EMPTY, 0)
-                    };
-                    let extra_copies = copies.saturating_sub(1).saturating_mul(child_cost.saturating_add(1));
-                    *budget = budget.checked_sub(extra_copies)?;
-                    total_cost = total_cost.saturating_add(child_cost).saturating_add(extra_copies);
-                    if !inner.is_empty() {
-                        let base = d.block(&ins.block).map_or(Vec2::ZERO, |blk| blk.base.xy());
-                        let m = ins.transform(base);
-                        let mut b0 = Bounds2::from_points(inner.corners().map(|c| m.apply(c)));
-                        if ins.cols > 1 || ins.rows > 1 {
-                            let off = Vec2::new(
-                                ins.col_spacing * f64::from(ins.cols.saturating_sub(1)),
-                                ins.row_spacing * f64::from(ins.rows.saturating_sub(1)),
-                            )
-                            .rotate(ins.rotation);
-                            b0 = b0.union(&Bounds2::from_points(b0.corners().map(|c| c + off)));
-                        }
-                        mb = b0;
-                    }
-                    if !ins.attribs.is_empty() {
-                        let mut attr_only = ins.clone();
-                        attr_only.block.clear();
-                        let ae = cadcraft_doc::Entity { handle: e.handle, common: e.common.clone(), kind: EntityKind::Insert(attr_only) };
-                        mb = mb.union(&cadcraft_doc::entity_bounds(d, &ae, depth));
-                    }
-                }
-                let mut no_blk = ml.clone();
-                no_blk.block = None;
-                let me = cadcraft_doc::Entity { handle: e.handle, common: e.common.clone(), kind: EntityKind::MLeader(no_blk) };
-                cadcraft_doc::entity_bounds(d, &me, depth).union(&mb)
-            }
-            _ => cadcraft_doc::entity_bounds(d, e, depth),
-        };
-        if !eb.is_empty() && eb.width().is_finite() && eb.height().is_finite() {
-            bounds = bounds.union(&eb);
-        }
-    }
-    memo.insert(key, (bounds, total_cost));
-    Some((bounds, total_cost))
-}
-
-/// Build the preview of block `name`: its objects as they draw, and their extents.
-/// Preflights entity expansion, polylines and hatch boundaries before bounds or rendering.
-/// The final output check also limits retained preview size; it is not an allocation guard for
-/// other entity kinds. An exhausted budget produces an empty placeholder, never a partial block.
-fn build(d: &Drawing, name: &str) -> Option<(cadcraft_render::DisplayList, Bounds2)> {
-    let b = d.block(name)?;
-    let mut budget = MAX_PREVIEW_BUDGET;
-    let mut memo = HashMap::new();
-    let Some((bounds, _)) = preview_block_bounds(d, name, 0, &mut budget, &mut memo) else {
-        return Some((cadcraft_render::DisplayList::default(), Bounds2::EMPTY));
-    };
-    if bounds.is_empty() {
-        return Some((cadcraft_render::DisplayList::default(), bounds));
-    }
-    let size = bounds.width().max(bounds.height()).max(1e-9);
-    let opts = cadcraft_render::Options {
-        tolerance: size / 500.0,
-        min_dash: size / 300.0,
-        view_height: size,
-        hatch_budget: Some(Arc::new(cadcraft_render::HatchBudget::new(250_000))),
-        ..Default::default()
-    };
-    let list = cadcraft_render::build_entities(d, b.entities.iter().map(|e| &**e), &opts);
-    let output_cost = list.expanded.saturating_add(list.prims.len()).saturating_add(list.verts.len() / 8).saturating_add(list.tris.len() / 8);
-    if output_cost > MAX_PREVIEW_OUTPUT {
-        return Some((cadcraft_render::DisplayList::default(), Bounds2::EMPTY));
-    }
-    Some((list, bounds))
-}
+mod preview;
+use preview::{PreviewFailure, PreviewResult, build};
 
 /// Draw a display list fitted into `r` on a framed square of the canvas colour.
 pub fn paint_list(p: &egui::Painter, r: Rect, list: &cadcraft_render::DisplayList, bounds: &Bounds2) {
@@ -662,11 +430,12 @@ fn view(app: &CadApp, st: &mut State, cache: &mut PreviewCache) -> Option<View> 
     Some(View { all, selected, info, can_write: app.services.pick_save.is_some() })
 }
 
-/// One frame's preview bookkeeping: the blocks seen in the scroll viewport (every other cached
-/// preview is evicted at the end of the frame) and how many uncached previews may still be built.
+/// One frame's visible set and allowance for starting synchronous builds. The elapsed-time
+/// check defers the next build; it cannot interrupt a build already in progress.
 struct FrameBuilds {
     visible: HashSet<String>,
     builds_left: usize,
+    started: web_time::Instant,
 }
 
 /// Render a single block tile/row according to `st.view_mode`, updating `frame` and `cache`
@@ -687,16 +456,17 @@ fn draw_block_item(
     }
     frame.visible.insert(name.to_string());
     if !cache.entries.contains_key(name) {
-        if frame.builds_left > 0 {
+        if frame.builds_left > 0 && frame.started.elapsed().as_millis() < 30 {
             frame.builds_left -= 1;
-            if let Some((list, bounds)) = build(d, name) {
-                cache.entries.insert(name.to_string(), Preview { list: Arc::new(list), bounds });
-            }
+            cache.insert(name.to_string(), build(d, name), &frame.visible);
         } else {
             ui.ctx().request_repaint();
         }
     }
+    cache.touch(name);
     let p = ui.painter();
+    let result = cache.entries.get(name).map(|e| &e.result);
+    let status = preview_status(result, d.block(name).is_some_and(|b| b.entities.is_empty()));
     if selected {
         p.rect_filled(rect, 3.0, t.accent.gamma_multiply(0.28));
         p.rect_stroke(rect, 3.0, Stroke::new(1.0, t.accent), egui::StrokeKind::Inside);
@@ -706,15 +476,14 @@ fn draw_block_item(
     match mode {
         ViewMode::List => {
             let thumb = Rect::from_min_size(pos2(rect.left() + 4.0, rect.top() + 3.0), vec2(26.0, (rect.height() - 6.0).max(16.0)));
-            if let Some(pv) = cache.entries.get(name) {
-                paint_list(p, thumb, &pv.list, &pv.bounds);
-            } else {
-                p.rect_stroke(thumb, 2.0, Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
-            }
+            paint_preview(p, thumb, result, &status, true);
             let text_x = thumb.right() + 6.0;
             let max_w = (rect.right() - text_x - 4.0).max(20.0);
             let label = truncate_text(p, name, &crate::theme::body(), t.text, max_w);
-            p.text(pos2(text_x, rect.center().y), egui::Align2::LEFT_CENTER, label, crate::theme::body(), t.text);
+            p.text(pos2(text_x, rect.top() + 2.0), egui::Align2::LEFT_TOP, label, crate::theme::body(), t.text);
+            if let Some(status) = &status {
+                p.text(pos2(text_x, rect.bottom() - 2.0), egui::Align2::LEFT_BOTTOM, status, crate::theme::small(), t.text_dim);
+            }
         }
         ViewMode::MediumIcons | ViewMode::LargeIcons => {
             let label_h = 18.0;
@@ -723,18 +492,45 @@ fn draw_block_item(
                 pos2(rect.left() + pad, rect.top() + pad),
                 pos2(rect.right() - pad, (rect.bottom() - label_h).max(rect.top() + 16.0)),
             );
-            if let Some(pv) = cache.entries.get(name) {
-                paint_list(p, thumb, &pv.list, &pv.bounds);
-            } else {
-                p.rect_stroke(thumb, 3.0, Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
-            }
+            paint_preview(p, thumb, result, &status, false);
             let max_w = (rect.width() - 6.0).max(20.0);
             let font = crate::theme::small();
             let label = truncate_text(p, name, &font, t.text, max_w);
             p.text(pos2(rect.center().x, rect.bottom() - label_h * 0.5), egui::Align2::CENTER_CENTER, label, font, t.text);
         }
     }
-    resp
+    if let Some(PreviewResult::Unavailable(reason)) = result {
+        resp.on_hover_text(format!("{}\n{}", crate::tl!("Preview unavailable"), crate::i18n::t(reason.message())))
+    } else if let Some(status) = status {
+        resp.on_hover_text(status)
+    } else {
+        resp
+    }
+}
+
+fn preview_status(result: Option<&PreviewResult>, empty_definition: bool) -> Option<&'static str> {
+    match result {
+        None => Some(crate::tl!("Preview pending")),
+        Some(PreviewResult::Ready(_)) => None,
+        Some(PreviewResult::Empty) if empty_definition => Some(crate::tl!("Empty block")),
+        Some(PreviewResult::Empty) => Some(crate::tl!("No visible content")),
+        Some(PreviewResult::Unavailable(_)) => Some(crate::tl!("Preview unavailable")),
+    }
+}
+
+fn paint_preview(p: &egui::Painter, rect: Rect, result: Option<&PreviewResult>, status: &Option<&'static str>, compact: bool) {
+    if let Some(PreviewResult::Ready(pv)) = result {
+        paint_list(p, rect, &pv.list, &pv.bounds);
+        return;
+    }
+    let t = Tokens::get();
+    p.rect_filled(rect, 3.0, t.canvas);
+    p.rect_stroke(rect, 3.0, Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
+    if let Some(text) = status {
+        let text = if compact { if matches!(result, Some(PreviewResult::Unavailable(_))) { "!" } else { "…" } } else { *text };
+        let galley = p.layout(text.to_string(), crate::theme::small(), t.text_dim, (rect.width() - 6.0).max(1.0));
+        p.with_clip_rect(rect).galley(rect.center() - galley.size() / 2.0, galley, t.text_dim);
+    }
 }
 
 /// A double-click's second release must not restart placement begun by its first click.
@@ -743,7 +539,7 @@ fn should_grab(drag: bool, click: bool, double_click: bool, grab_on_click: bool)
 }
 
 /// The manager's contents: top filter + view-mode slider/menu, scrollable block grid/list with
-/// visible-only previews, insertion options, and block editing controls.
+/// cached previews, insertion options, and block editing controls.
 fn body(ui: &mut egui::Ui, d: &Drawing, v: &View, st: &mut State, cache: &mut PreviewCache, as_panel: bool, act: &mut Option<Act>) {
     let View { all, selected, info, can_write, .. } = v;
     let can_write = *can_write;
@@ -814,7 +610,7 @@ fn body(ui: &mut egui::Ui, d: &Drawing, v: &View, st: &mut State, cache: &mut Pr
     let list_h = (avail.y - bottom_reserve).clamp(140.0, 420.0);
     let list_w = avail.x;
 
-    let mut frame = FrameBuilds { visible: HashSet::new(), builds_left: MAX_BUILDS_PER_FRAME };
+    let mut frame = FrameBuilds { visible: HashSet::new(), builds_left: MAX_BUILDS_PER_FRAME, started: web_time::Instant::now() };
 
     egui::Frame::NONE.stroke(Stroke::new(1.0, t.border)).inner_margin(4.0).show(ui, |ui| {
         egui::ScrollArea::vertical().id_salt("cc_block_list").auto_shrink([false, false]).max_height(list_h).show(ui, |ui| {
@@ -893,8 +689,7 @@ fn body(ui: &mut egui::Ui, d: &Drawing, v: &View, st: &mut State, cache: &mut Pr
         });
     });
 
-    // Unload every block preview that was not visible in the viewport this frame.
-    cache.retain_visible(&frame.visible);
+    cache.evict(&frame.visible);
 
     ui.add_space(4.0);
 
@@ -1220,7 +1015,14 @@ mod tests {
     use cadcraft_engine::{Input, Session};
     use serde_json::json;
 
-    use super::{Preview, PreviewCache, State, ViewMode, grab_block};
+    use super::{PreviewCache, PreviewResult, State, ViewMode, grab_block};
+
+    fn ready(d: &cadcraft_doc::Drawing, name: &str) -> (cadcraft_render::DisplayList, cadcraft_geom::Bounds2) {
+        let PreviewResult::Ready(p) = super::build(d, name) else {
+            panic!("expected ready {name}");
+        };
+        ((*p.list).clone(), p.bounds)
+    }
     use crate::{CadApp, Services};
 
     /// Programmatic INSERT (including aliases and missing parameters) never opens a palette.
@@ -1286,70 +1088,6 @@ mod tests {
         assert!(cache.references.is_none());
     }
 
-    #[test]
-    fn attribute_previews_are_budgeted_before_bounds_and_rendering() {
-        use cadcraft_doc::{Block, Drawing, Entity, Handle};
-        let attribute: cadcraft_doc::Attrib = serde_json::from_value(json!({
-            "tag": "A", "text": {"insert": [0, 0, 0], "height": 1, "value": "ok"}
-        }))
-        .unwrap();
-        let mut insert: cadcraft_doc::Insert = serde_json::from_value(json!({
-            "block": "Missing", "insert": [0, 0, 0], "scale": [1, 1, 1], "attribs": []
-        }))
-        .unwrap();
-        let mut d = Drawing::default();
-        insert.attribs.push(attribute.clone());
-        let mut normal = Block::new("Normal");
-        normal.entities.push(Entity::new(Handle(1), EntityKind::Insert(insert.clone())));
-        d.blocks.insert("Normal".into(), Arc::new(normal));
-        assert!(!super::build(&d, "Normal").unwrap().0.prims.is_empty());
-
-        insert.attribs = vec![attribute.clone(); super::MAX_PREVIEW_BUDGET + 1];
-        assert!(super::preview_insert_cost(&insert, super::MAX_PREVIEW_BUDGET).is_none());
-        let mut large = Block::new("Large");
-        large.entities.push(Entity::new(Handle(2), EntityKind::Insert(insert.clone())));
-        d.blocks.insert("Large".into(), Arc::new(large));
-        let mut nested = Block::new("Nested");
-        insert.block = "Large".into();
-        insert.attribs.clear();
-        nested.entities.push(Entity::new(Handle(3), EntityKind::Insert(insert.clone())));
-        d.blocks.insert("Nested".into(), Arc::new(nested));
-        for name in ["Large", "Nested"] {
-            assert!(super::build(&d, name).unwrap().0.prims.is_empty());
-        }
-        let mut long = attribute;
-        long.text.value = "x".repeat(super::MAX_PREVIEW_BUDGET + 1);
-        insert.attribs.push(long);
-        assert!(super::preview_insert_cost(&insert, super::MAX_PREVIEW_BUDGET).is_none());
-    }
-
-    /// Reject oversized hatch boundaries before bounds/tessellation, including nested references.
-    #[test]
-    fn oversized_hatch_previews_use_placeholders_before_expensive_processing() {
-        use cadcraft_doc::{Block, Drawing, Entity, Handle, Hatch, HatchLoop};
-        let mut d = Drawing::default();
-        let mut hatch: Hatch = serde_json::from_value(json!({"pattern": "SOLID", "solid": true, "loops": []})).unwrap();
-        hatch.loops.push(HatchLoop {
-            vertices: vec![cadcraft_geom::PolyVertex::new(Vec2::ZERO); super::MAX_PREVIEW_BUDGET + 1],
-            outer: true,
-            sources: Vec::new(),
-        });
-        let kind = EntityKind::Hatch(hatch);
-        assert!(super::preview_entity_cost(&kind, super::MAX_PREVIEW_BUDGET).is_none());
-        let mut block = Block::new("Hatched");
-        block.entities.push(Entity::new(Handle(1), kind));
-        d.blocks.insert("Hatched".into(), Arc::new(block));
-        let mut nested = Block::new("NestedHatch");
-        let insert = serde_json::from_value(json!({"block": "Hatched", "insert": [0,0,0], "scale": [1,1,1], "rotation": 0, "attribs": []})).unwrap();
-        nested.entities.push(Entity::new(Handle(2), EntityKind::Insert(insert)));
-        d.blocks.insert("NestedHatch".into(), Arc::new(nested));
-        for name in ["Hatched", "NestedHatch"] {
-            let (list, bounds) = super::build(&d, name).unwrap();
-            assert!(list.prims.is_empty());
-            assert!(bounds.is_empty());
-        }
-    }
-
     /// Ordinary thumbnails retain fills, motifs and curved boundaries, matching normal rendering.
     #[test]
     fn ordinary_hatches_keep_fills_and_patterns_in_previews() {
@@ -1370,7 +1108,7 @@ mod tests {
             let mut b = Block::new(name);
             b.entities.push(Entity::new(Handle(1), EntityKind::Hatch(hatch)));
             d.blocks.insert(name.into(), Arc::new(b));
-            let (list, bounds) = super::build(&d, name).unwrap();
+            let (list, bounds) = ready(&d, name);
             assert!(!bounds.is_empty(), "{name}");
             assert!(!list.prims.is_empty(), "{name}");
             if solid {
@@ -1411,346 +1149,6 @@ mod tests {
         }
     }
 
-    /// One entity can contain more geometry than thousands of simple entities. Reject it before
-    /// bounds traversal (which itself clones polylines), including through nested block references.
-    #[test]
-    fn oversized_polyline_previews_are_rejected_before_bounds() {
-        use cadcraft_doc::{Block, Drawing, Entity, Handle, LwPolyline, Polyline3d};
-        use cadcraft_geom::PolyVertex;
-        let mut d = Drawing::default();
-        for (name, count, bulge, width) in [("Large", 32769, 0.0, 0.0), ("Curved", 128, 1.0, 0.0), ("Wide", 16, 1.0, 2.0)] {
-            let vertices = (0..count).map(|i| PolyVertex { bulge, ..PolyVertex::new(Vec2::new(f64::from(i), 0.0)) }).collect();
-            let mut block = Block::new(name);
-            block.entities.push(Entity::new(
-                Handle(1),
-                EntityKind::LwPolyline(LwPolyline { vertices, closed: false, const_width: width, elevation: 0.0, plinegen: false }),
-            ));
-            d.blocks.insert(name.into(), Arc::new(block));
-        }
-        let mut block = Block::new("ThreeD");
-        block
-            .entities
-            .push(Entity::new(Handle(2), EntityKind::Polyline3d(Polyline3d { points: vec![cadcraft_geom::Vec3::ZERO; 32769], closed: false })));
-        d.blocks.insert("ThreeD".into(), Arc::new(block));
-        let mut nested = Block::new("Nested");
-        let insert = cadcraft_doc::Insert {
-            block: "Large".into(),
-            insert: cadcraft_geom::Vec3::ZERO,
-            scale: cadcraft_geom::Vec3::new(1.0, 1.0, 1.0),
-            rotation: 0.0,
-            attribs: Vec::new(),
-            cols: 1,
-            rows: 1,
-            col_spacing: 0.0,
-            row_spacing: 0.0,
-        };
-        nested.entities.push(Entity::new(Handle(4), EntityKind::Insert(insert)));
-        d.blocks.insert("Nested".into(), Arc::new(nested));
-        for name in ["Large", "Curved", "Wide", "ThreeD", "Nested"] {
-            let mut budget = super::MAX_PREVIEW_BUDGET;
-            assert!(super::preview_block_bounds(&d, name, 0, &mut budget, &mut Default::default()).is_none());
-            let (list, bounds) = super::build(&d, name).unwrap();
-            assert!(list.prims.is_empty());
-            assert!(bounds.is_empty());
-        }
-        // A normal-sized polyline still has a visible preview.
-        let mut block = Block::new("Small");
-        block.entities.push(Entity::new(
-            Handle(3),
-            EntityKind::LwPolyline(LwPolyline {
-                vertices: vec![PolyVertex::new(Vec2::ZERO), PolyVertex::new(Vec2::X)],
-                closed: false,
-                const_width: 0.0,
-                elevation: 0.0,
-                plinegen: false,
-            }),
-        ));
-        d.blocks.insert("Small".into(), Arc::new(block));
-        assert!(!super::build(&d, "Small").unwrap().0.prims.is_empty());
-    }
-
-    #[test]
-    fn detailed_previews_have_separate_preflight_and_output_allowances() {
-        use cadcraft_doc::{Block, Drawing, Entity, Handle, Line, LwPolyline};
-        use cadcraft_geom::{PolyVertex, Vec3};
-        let mut d = Drawing::default();
-        let mut many = Block::new("ManyLines");
-        for i in 0..12_000 {
-            many.entities
-                .push(Entity::new(Handle(i + 1), EntityKind::Line(Line { a: Vec3::new(i as f64, 0.0, 0.0), b: Vec3::new(i as f64, 1.0, 0.0) })));
-        }
-        d.blocks.insert("ManyLines".into(), Arc::new(many));
-        let (list, bounds) = super::build(&d, "ManyLines").unwrap();
-        assert!(!bounds.is_empty());
-        assert_eq!(list.prims.len(), 12_000);
-
-        let mut curved = Block::new("CurvedBands");
-        let vertices = (0..8).map(|i| PolyVertex { bulge: 1.0, ..PolyVertex::new(Vec2::new(f64::from(i), 0.0)) }).collect();
-        curved.entities.push(Entity::new(
-            Handle(20_001),
-            EntityKind::LwPolyline(LwPolyline { vertices, closed: false, const_width: 2.0, elevation: 0.0, plinegen: false }),
-        ));
-        d.blocks.insert("CurvedBands".into(), Arc::new(curved));
-        assert!(!super::build(&d, "CurvedBands").unwrap().0.prims.is_empty());
-    }
-
-    /// Reject oversized leader and wipeout geometry before bounds traversal and display-list build.
-    #[test]
-    fn oversized_leader_and_wipeout_previews_are_rejected_before_bounds_or_rendering() {
-        use cadcraft_doc::{Block, Drawing, Entity, Handle, Leader, Wipeout};
-        let mut d = Drawing::default();
-
-        let oversized_leader = EntityKind::Leader(Leader {
-            vertices: vec![cadcraft_geom::Vec3::ZERO; super::MAX_PREVIEW_BUDGET + 1],
-            arrow: true,
-            spline: false,
-            style: "STANDARD".into(),
-        });
-        assert!(super::preview_entity_cost(&oversized_leader, super::MAX_PREVIEW_BUDGET).is_none());
-        let mut l_block = Block::new("BigLeader");
-        l_block.entities.push(Entity::new(Handle(1), oversized_leader));
-        d.blocks.insert("BigLeader".into(), Arc::new(l_block));
-
-        let oversized_wipeout = EntityKind::Wipeout(Wipeout { boundary: vec![Vec2::ZERO; super::MAX_PREVIEW_BUDGET + 1] });
-        assert!(super::preview_entity_cost(&oversized_wipeout, super::MAX_PREVIEW_BUDGET).is_none());
-        let mut w_block = Block::new("BigWipeout");
-        w_block.entities.push(Entity::new(Handle(2), oversized_wipeout));
-        d.blocks.insert("BigWipeout".into(), Arc::new(w_block));
-
-        // Wipeout with input + expanded mask and frame exceeding budget
-        let expanding_wipeout = EntityKind::Wipeout(Wipeout { boundary: vec![Vec2::ZERO; 30_000] });
-        assert!(super::preview_entity_cost(&expanding_wipeout, super::MAX_PREVIEW_BUDGET).is_none());
-        let mut ew_block = Block::new("ExpandingWipeout");
-        ew_block.entities.push(Entity::new(Handle(3), expanding_wipeout));
-        d.blocks.insert("ExpandingWipeout".into(), Arc::new(ew_block));
-
-        for name in ["BigLeader", "BigWipeout", "ExpandingWipeout"] {
-            let mut budget = super::MAX_PREVIEW_BUDGET;
-            assert!(super::preview_block_bounds(&d, name, 0, &mut budget, &mut Default::default()).is_none());
-            let (list, bounds) = super::build(&d, name).unwrap();
-            assert!(list.prims.is_empty(), "{name} should emit empty display list");
-            assert!(bounds.is_empty(), "{name} should have empty bounds");
-        }
-
-        // Normal-sized leader and wipeout build visible previews
-        let mut normal_l = Block::new("NormalLeader");
-        normal_l.entities.push(Entity::new(
-            Handle(4),
-            EntityKind::Leader(Leader {
-                vertices: vec![cadcraft_geom::Vec3::ZERO, cadcraft_geom::Vec3::new(10.0, 10.0, 0.0)],
-                arrow: true,
-                spline: false,
-                style: "STANDARD".into(),
-            }),
-        ));
-        d.blocks.insert("NormalLeader".into(), Arc::new(normal_l));
-        let (list, bounds) = super::build(&d, "NormalLeader").unwrap();
-        assert!(!list.prims.is_empty());
-        assert!(!bounds.is_empty());
-
-        let mut normal_w = Block::new("NormalWipeout");
-        normal_w.entities.push(Entity::new(
-            Handle(5),
-            EntityKind::Wipeout(Wipeout { boundary: vec![Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), Vec2::new(10.0, 10.0), Vec2::new(0.0, 10.0)] }),
-        ));
-        d.blocks.insert("NormalWipeout".into(), Arc::new(normal_w));
-        let (list, bounds) = super::build(&d, "NormalWipeout").unwrap();
-        assert!(!list.prims.is_empty());
-        assert!(!bounds.is_empty());
-    }
-
-    /// Oversized text and MText payloads are bounded by preflight budget before text layout or shaping.
-    #[test]
-    fn oversized_text_previews_are_rejected_before_bounds_or_shaping() {
-        use cadcraft_doc::{Block, Drawing, Entity, Handle, MText, Text};
-        let mut d = Drawing::default();
-        let mut normal_blk = Block::new("NormalText");
-        normal_blk.entities.push(Entity::new(
-            Handle(1),
-            EntityKind::Text(Text {
-                insert: cadcraft_geom::Vec3::ZERO,
-                align_pt: None,
-                height: 2.5,
-                value: "ROOM 101".into(),
-                rotation: 0.0,
-                width_factor: 1.0,
-                oblique: 0.0,
-                style: "STANDARD".into(),
-                halign: Default::default(),
-                valign: Default::default(),
-            }),
-        ));
-        normal_blk.entities.push(Entity::new(
-            Handle(2),
-            EntityKind::MText(MText {
-                insert: cadcraft_geom::Vec3::ZERO,
-                height: 2.5,
-                width: 50.0,
-                attach: 1,
-                rotation: 0.0,
-                style: "STANDARD".into(),
-                contents: "Specification paragraph with details".into(),
-                line_spacing: 1.0,
-                line_spacing_exact: false,
-                columns: None,
-            }),
-        ));
-        d.blocks.insert("NormalText".into(), Arc::new(normal_blk));
-        let (list, bounds) = super::build(&d, "NormalText").expect("normal text previews");
-        assert!(!bounds.is_empty());
-        assert!(!list.prims.is_empty());
-
-        let mut oversized_blk = Block::new("OversizedText");
-        oversized_blk.entities.push(Entity::new(
-            Handle(3),
-            EntityKind::Text(Text {
-                insert: cadcraft_geom::Vec3::ZERO,
-                align_pt: None,
-                height: 2.5,
-                value: "A".repeat(super::MAX_PREVIEW_BUDGET + 10),
-                rotation: 0.0,
-                width_factor: 1.0,
-                oblique: 0.0,
-                style: "STANDARD".into(),
-                halign: Default::default(),
-                valign: Default::default(),
-            }),
-        ));
-        d.blocks.insert("OversizedText".into(), Arc::new(oversized_blk));
-        let (list, bounds) = super::build(&d, "OversizedText").expect("block entry exists");
-        assert!(bounds.is_empty() && list.prims.is_empty(), "oversized text payload must preview as an empty placeholder");
-
-        let mut mtext = MText {
-            insert: cadcraft_geom::Vec3::ZERO,
-            height: 2.5,
-            width: 50.0,
-            attach: 1,
-            rotation: 0.0,
-            style: "STANDARD".into(),
-            contents: "A".into(),
-            line_spacing: 1.0,
-            line_spacing_exact: false,
-            columns: Some(cadcraft_doc::MTextColumns {
-                kind: cadcraft_doc::MTextColumnType::Dynamic,
-                auto_height: false,
-                heights: vec![1.0; super::MAX_PREVIEW_BUDGET + 1],
-                ..Default::default()
-            }),
-        };
-        assert!(super::preview_entity_cost(&EntityKind::MText(mtext.clone()), super::MAX_PREVIEW_BUDGET).is_none());
-        mtext.columns = None;
-        mtext.contents = "A".repeat(super::MAX_PREVIEW_BUDGET + 1);
-        assert!(super::preview_entity_cost(&EntityKind::MText(mtext), super::MAX_PREVIEW_BUDGET).is_none());
-    }
-
-    /// Splines reserve their sampling work in the shared preview budget: an ordinary block of splines
-    /// still previews, while a block of thousands is refused before any bounds sampling or tessellation.
-    #[test]
-    fn splines_are_charged_to_the_preview_budget() {
-        use cadcraft_doc::{Block, Drawing, Entity, Handle};
-        let spline = || EntityKind::Spline(cadcraft_geom::Spline::default());
-        let one = super::preview_entity_cost(&spline(), super::MAX_PREVIEW_BUDGET).unwrap_or(0);
-        assert!(one >= super::SPLINE_PREVIEW_SAMPLES.div_ceil(super::SPLINE_SAMPLES_PER_UNIT), "a spline must reserve its sampling work, got {one}");
-
-        let bounds_of = |count: u64| {
-            let mut d = Drawing::default();
-            let mut block = Block::new("Splines");
-            for i in 0..count {
-                block.entities.push(Entity::new(Handle(i + 1), spline()));
-            }
-            d.blocks.insert("Splines".into(), Arc::new(block));
-            let mut budget = super::MAX_PREVIEW_BUDGET;
-            super::preview_block_bounds(&d, "Splines", 0, &mut budget, &mut std::collections::HashMap::new()).is_some()
-        };
-        assert!(bounds_of(30), "an ordinary block of 30 splines must stay within the budget");
-        assert!(!bounds_of(5_000), "a block of thousands of splines must be refused");
-    }
-    /// Preflight budget must account for array copies of blocks referenced by MLeaders.
-    #[test]
-    fn mleader_array_inserts_are_bounded_by_preflight_budget() {
-        use cadcraft_doc::{Block, Drawing, Entity, Handle, Line, MLeader};
-        let mut d = Drawing::default();
-        let mut target = Block::new("Target");
-        target
-            .entities
-            .push(Entity::new(Handle(1), EntityKind::Line(Line { a: cadcraft_geom::Vec3::ZERO, b: cadcraft_geom::Vec3::new(5.0, 5.0, 0.0) })));
-        d.blocks.insert("Target".into(), Arc::new(target));
-
-        let oversized_mleader_lines = EntityKind::MLeader(MLeader {
-            leaders: vec![vec![cadcraft_geom::Vec3::ZERO; super::MAX_PREVIEW_BUDGET + 1]],
-            landing: cadcraft_geom::Vec3::ZERO,
-            dogleg: 0.0,
-            text: None,
-            style: "STANDARD".into(),
-            arrow_size: 1.0,
-            spline: false,
-            block: None,
-        });
-        assert!(super::preview_entity_cost(&oversized_mleader_lines, super::MAX_PREVIEW_BUDGET).is_none());
-
-        let oversized_mleader = EntityKind::MLeader(MLeader {
-            leaders: vec![vec![cadcraft_geom::Vec3::ZERO, cadcraft_geom::Vec3::new(10.0, 0.0, 0.0)]],
-            landing: cadcraft_geom::Vec3::new(12.0, 0.0, 0.0),
-            dogleg: 2.0,
-            text: None,
-            style: "STANDARD".into(),
-            arrow_size: 1.0,
-            spline: false,
-            block: Some(cadcraft_doc::Insert {
-                block: "Target".into(),
-                insert: cadcraft_geom::Vec3::new(14.0, 0.0, 0.0),
-                scale: cadcraft_geom::Vec3::new(1.0, 1.0, 1.0),
-                rotation: 0.0,
-                attribs: Vec::new(),
-                cols: 200,
-                rows: 200,
-                col_spacing: 10.0,
-                row_spacing: 10.0,
-            }),
-        });
-        let mut big_ml_block = Block::new("BigMLeaderArray");
-        big_ml_block.entities.push(Entity::new(Handle(2), oversized_mleader));
-        d.blocks.insert("BigMLeaderArray".into(), Arc::new(big_ml_block));
-
-        let mut budget = super::MAX_PREVIEW_BUDGET;
-        assert!(super::preview_block_bounds(&d, "BigMLeaderArray", 0, &mut budget, &mut Default::default()).is_none());
-        let (list, bounds) = super::build(&d, "BigMLeaderArray").unwrap();
-        assert!(list.prims.is_empty(), "oversized array insert in MLeader produces placeholder");
-        assert!(bounds.is_empty());
-
-        // Small array within budget produces a non-empty preview with bounds spanning the array
-        let normal_mleader = EntityKind::MLeader(MLeader {
-            leaders: vec![vec![cadcraft_geom::Vec3::ZERO, cadcraft_geom::Vec3::new(10.0, 0.0, 0.0)]],
-            landing: cadcraft_geom::Vec3::new(12.0, 0.0, 0.0),
-            dogleg: 2.0,
-            text: None,
-            style: "STANDARD".into(),
-            arrow_size: 1.0,
-            spline: false,
-            block: Some(cadcraft_doc::Insert {
-                block: "Target".into(),
-                insert: cadcraft_geom::Vec3::new(14.0, 0.0, 0.0),
-                scale: cadcraft_geom::Vec3::new(1.0, 1.0, 1.0),
-                rotation: 0.0,
-                attribs: Vec::new(),
-                cols: 2,
-                rows: 2,
-                col_spacing: 10.0,
-                row_spacing: 10.0,
-            }),
-        });
-        let mut normal_ml_block = Block::new("NormalMLeaderArray");
-        normal_ml_block.entities.push(Entity::new(Handle(3), normal_mleader));
-        d.blocks.insert("NormalMLeaderArray".into(), Arc::new(normal_ml_block));
-
-        let (list, bounds) = super::build(&d, "NormalMLeaderArray").unwrap();
-        assert!(!list.prims.is_empty());
-        assert!(!bounds.is_empty());
-        // The array spacing extends the bounds to at least 14 + 10 = 24 in x and 10 in y
-        assert!(bounds.max.x >= 24.0);
-        assert!(bounds.max.y >= 10.0);
-    }
-
     /// Verify block enumeration, reference counting and preview display-list generation.
     #[test]
     fn blocks_list_their_references_and_build_a_preview() {
@@ -1763,14 +1161,14 @@ mod tests {
         let d = s.doc().unwrap();
         assert_eq!(super::names(d), ["Bolt"]);
         assert_eq!(super::reference_count(d, "bolt"), 2);
-        let (list, bounds) = super::build(d, "Bolt").unwrap();
+        let (list, bounds) = ready(d, "Bolt");
         assert!(!list.prims.is_empty());
         assert!((bounds.width() - 4.0).abs() < 1e-6);
     }
 
-    /// Verify view-mode index round-tripping and eviction of off-screen previews.
+    /// Verify view-mode index round-tripping and retention across scrolling.
     #[test]
-    fn offscreen_previews_are_unloaded_and_view_modes_roundtrip() {
+    fn offscreen_previews_are_reused_and_view_modes_roundtrip() {
         for (idx, mode) in [(0, ViewMode::List), (1, ViewMode::MediumIcons), (2, ViewMode::LargeIcons)] {
             assert_eq!(ViewMode::from_index(idx), mode);
             assert_eq!(mode.index(), idx);
@@ -1785,18 +1183,18 @@ mod tests {
         let mut cache = PreviewCache::default();
         cache.sync_revision(1, 1);
         for name in ["B1", "B2", "B3"] {
-            let (list, bounds) = super::build(d, name).unwrap();
-            cache.entries.insert(name.into(), Preview { list: Arc::new(list), bounds });
+            let (list, bounds) = ready(d, name);
+            cache.insert(name.into(), PreviewResult::Ready(super::Preview { list: Arc::new(list), bounds }), &HashSet::new());
         }
         assert_eq!(cache.len(), 3);
 
-        // Only B2 remains visible in the viewport: B1 and B3 are immediately unloaded.
+        // Only B2 remains visible; a return to B1/B3 reuses their cached results.
         let visible: HashSet<String> = ["B2".to_string()].into_iter().collect();
-        cache.retain_visible(&visible);
-        assert_eq!(cache.len(), 1);
+        cache.evict(&visible);
+        assert_eq!(cache.len(), 3);
         assert!(cache.entries.contains_key("B2"));
-        assert!(!cache.entries.contains_key("B1"));
-        assert!(!cache.entries.contains_key("B3"));
+        assert!(cache.entries.contains_key("B1"));
+        assert!(cache.entries.contains_key("B3"));
 
         // A new drawing revision clears everything.
         cache.sync_revision(1, 2);
@@ -1973,3 +1371,6 @@ mod tests {
         assert_eq!(app.session.running.as_ref().map(|r| r.id.as_str()), Some("insert"));
     }
 }
+
+#[cfg(test)]
+mod library_audit;

@@ -700,7 +700,7 @@ impl Interactive for InsertM {
                 let name = self.file.as_ref().map(|f| f.name.clone()).unwrap_or_default();
                 Prompt::new(format!("Block \"{name}\" already exists. Redefine it?"), super::curves::KW).kw(&["Yes", "No"]).default("N")
             }
-            InsStage::Point => Prompt::new("Specify insertion point", Accept::POINT).kw(&["Basepoint", "Scale", "Rotate", "Repeat", "NoRepeat"]),
+            InsStage::Point => Prompt::new("Specify insertion point", Accept::POINT).kw(&["Basepoint", "Scale", "Rotate", "REpeat", "NoRepeat"]),
             InsStage::BasePoint => Prompt::new("Specify base point", Accept::POINT),
             InsStage::PresetScale => Prompt::new("Specify scale factor for XYZ axes", Accept::NUMBER).default("1"),
             InsStage::PresetRotation => Prompt::new("Specify rotation angle", Accept::NUMBER).default("0"),
@@ -719,7 +719,7 @@ impl Interactive for InsertM {
     /// Feed user input into the interactive `INSERT` state machine.
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
         if let Input::Keyword(k) = &i {
-            if k == "Repeat" {
+            if k.eq_ignore_ascii_case("Repeat") {
                 self.repeat = true;
                 return Ok(Step::Continue);
             }
@@ -952,8 +952,10 @@ mod tests {
         s.start("insert").unwrap();
         s.input(Input::Text("B1".into())).unwrap();
         let p = s.current_prompt().unwrap();
-        assert!(p.keywords.iter().any(|k| k == "Repeat"));
+        assert!(p.keywords.iter().any(|k| k == "REpeat"));
         assert!(p.keywords.iter().any(|k| k == "NoRepeat"));
+        assert_eq!(p.match_keyword("R").as_deref(), Some("Rotate"));
+        assert_eq!(p.match_keyword("RE").as_deref(), Some("REpeat"));
 
         // Complete a placement and verify Repeat returns INSERT to the insertion-point prompt.
         s.cmdline("Repeat").unwrap();

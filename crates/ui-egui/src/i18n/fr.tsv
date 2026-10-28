@@ -1046,3 +1046,12 @@
 	Check for Updates…	Rechercher des mises à jour…
 	CADCraft is up to date.	CADCraft est à jour.
 	Could not check for updates.	Impossible de rechercher les mises à jour.
+	Preview pending	Aperçu en attente
+	Preview unavailable	Aperçu indisponible
+	No visible content	Aucun contenu visible
+	Empty block	Bloc vide
+	Excessive preview input	Données d’entrée trop volumineuses
+	Excessive preview computation	Coût de calcul excessif
+	Excessive preview output	Sortie de l’aperçu trop volumineuse
+	Invalid preview data	Données invalides pour l’aperçu
+	Missing block reference	Référence de bloc manquante
