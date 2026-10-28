@@ -716,6 +716,7 @@ fn collect_prompt_clicks(app: &mut CadApp, ui: &egui::Ui, context: PromptClickCo
                 if !context.rect.contains(*pos)
                     || over_canvas_menu(app, *pos)
                     || over_navigation_control(app, context.rect, *pos)
+                    || (app.ui.show_command_line && app.cmd.ime_rect.is_some_and(|(bar, _)| bar.contains(*pos)))
                     || ui.ctx().layer_id_at(*pos) != Some(ui.layer_id())
                 {
                     continue;
@@ -780,7 +781,15 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     let PointerInput { hover_pos, mods, middle_down, pressed_primary, pressed_secondary, dbl_primary, .. } = pointer;
     // A menu may close on press; retain ownership of the gesture through release.
     if ui.ctx().current_pass_index() == 0 && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary)) {
-        app.canvas.menu_press = on_menu;
+        // Test where the press happened (`hover_pos` may already be after a move in the same frame); the last press
+        // is the one whose release places a point.
+        let press_at = ui.input(|i| {
+            i.events.iter().rev().find_map(|e| match e {
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, .. } => Some(*pos),
+                _ => None,
+            })
+        });
+        app.canvas.menu_press = press_at.map_or(on_menu, |at| over_canvas_menu(app, at));
     }
     let menu_click = on_menu || app.canvas.menu_press;
     // Re-read the view after navigation.

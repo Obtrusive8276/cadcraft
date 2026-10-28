@@ -862,6 +862,8 @@ fn apply(app: &mut CadApp, st: &mut State, act: Option<Act>, esc_pressed: bool) 
             st.rename = Some(n);
             return true;
         }
+        // Confirming the name unchanged is not an edit: keep the placement in progress.
+        Some(Act::Rename(from, to)) if from == to => st.rename = None,
         Some(Act::Rename(from, to)) => {
             cancel_pending_insert(app, st);
             match app.run("rename", json!({ "table": "block", "from": from, "to": to })) {
@@ -1359,6 +1361,22 @@ mod tests {
         super::apply(&mut app, &mut st, None, false);
         assert!(!st.repeating);
         assert!(!st.repeat);
+    }
+
+    /// Confirming a block name unchanged closes the editor and leaves a placement in progress alone.
+    #[test]
+    fn renaming_to_the_same_name_keeps_the_insert_running() {
+        let mut app = CadApp::new(Session::new(), Services::default());
+        let circle = app.session.execute("circle", &json!({"center": [0, 0], "radius": 2})).unwrap();
+        app.session.execute("block", &json!({"name": "Pin", "base": [0, 0], "handles": [circle["handle"]], "keep": "delete"})).unwrap();
+        let mut st = State::default();
+        super::apply(&mut app, &mut st, Some(super::Act::Grab("Pin".into())), false);
+        assert_eq!(app.session.current_prompt().map(|p| p.message), Some("Specify insertion point".to_string()));
+        st.rename = Some("Pin".into());
+        super::apply(&mut app, &mut st, Some(super::Act::Rename("Pin".into(), "Pin".into())), false);
+        assert!(st.rename.is_none());
+        assert_eq!(app.session.running.as_ref().map(|r| r.id.as_str()), Some("insert"));
+        assert_eq!(app.session.current_prompt().map(|p| p.message), Some("Specify insertion point".to_string()));
     }
 
     /// Clicking Insert while the rename editor is open clears rename and starts insertion without cancelling it on the next frame.
