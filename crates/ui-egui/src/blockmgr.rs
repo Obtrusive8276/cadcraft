@@ -189,7 +189,11 @@ pub fn reference_count(d: &Drawing, name: &str) -> usize {
 
 /// Maximum work units (visited entities and expanded block references) and output primitives/vertices
 /// allowed when building a single palette thumbnail before returning an empty placeholder.
-const MAX_PREVIEW_BUDGET: usize = 8_192;
+const MAX_PREVIEW_BUDGET: usize = 32_768;
+
+/// A separate limit for the completed display list. Preflight and output measure different work;
+/// charging both against the same remainder rejects modest, detailed blocks twice.
+const MAX_PREVIEW_OUTPUT: usize = 32_768;
 
 /// Most points a single spline is sampled at while measuring or drawing a preview (the geometry
 /// crate's own cap); charged against the preview budget for every spline in a block.
@@ -483,7 +487,7 @@ fn build(d: &Drawing, name: &str) -> Option<(cadcraft_render::DisplayList, Bound
     };
     let list = cadcraft_render::build_entities(d, b.entities.iter().map(|e| &**e), &opts);
     let output_cost = list.expanded.saturating_add(list.prims.len()).saturating_add(list.verts.len() / 8).saturating_add(list.tris.len() / 8);
-    if output_cost > budget {
+    if output_cost > MAX_PREVIEW_OUTPUT {
         return Some((cadcraft_render::DisplayList::default(), Bounds2::EMPTY));
     }
     Some((list, bounds))
@@ -1414,7 +1418,7 @@ mod tests {
         use cadcraft_doc::{Block, Drawing, Entity, Handle, LwPolyline, Polyline3d};
         use cadcraft_geom::PolyVertex;
         let mut d = Drawing::default();
-        for (name, count, bulge, width) in [("Large", 8193, 0.0, 0.0), ("Curved", 64, 1.0, 0.0), ("Wide", 8, 1.0, 2.0)] {
+        for (name, count, bulge, width) in [("Large", 32769, 0.0, 0.0), ("Curved", 128, 1.0, 0.0), ("Wide", 16, 1.0, 2.0)] {
             let vertices = (0..count).map(|i| PolyVertex { bulge, ..PolyVertex::new(Vec2::new(f64::from(i), 0.0)) }).collect();
             let mut block = Block::new(name);
             block.entities.push(Entity::new(
@@ -1426,7 +1430,7 @@ mod tests {
         let mut block = Block::new("ThreeD");
         block
             .entities
-            .push(Entity::new(Handle(2), EntityKind::Polyline3d(Polyline3d { points: vec![cadcraft_geom::Vec3::ZERO; 8193], closed: false })));
+            .push(Entity::new(Handle(2), EntityKind::Polyline3d(Polyline3d { points: vec![cadcraft_geom::Vec3::ZERO; 32769], closed: false })));
         d.blocks.insert("ThreeD".into(), Arc::new(block));
         let mut nested = Block::new("Nested");
         let insert = cadcraft_doc::Insert {
@@ -1465,6 +1469,31 @@ mod tests {
         assert!(!super::build(&d, "Small").unwrap().0.prims.is_empty());
     }
 
+    #[test]
+    fn detailed_previews_have_separate_preflight_and_output_allowances() {
+        use cadcraft_doc::{Block, Drawing, Entity, Handle, Line, LwPolyline};
+        use cadcraft_geom::{PolyVertex, Vec3};
+        let mut d = Drawing::default();
+        let mut many = Block::new("ManyLines");
+        for i in 0..12_000 {
+            many.entities
+                .push(Entity::new(Handle(i + 1), EntityKind::Line(Line { a: Vec3::new(i as f64, 0.0, 0.0), b: Vec3::new(i as f64, 1.0, 0.0) })));
+        }
+        d.blocks.insert("ManyLines".into(), Arc::new(many));
+        let (list, bounds) = super::build(&d, "ManyLines").unwrap();
+        assert!(!bounds.is_empty());
+        assert_eq!(list.prims.len(), 12_000);
+
+        let mut curved = Block::new("CurvedBands");
+        let vertices = (0..8).map(|i| PolyVertex { bulge: 1.0, ..PolyVertex::new(Vec2::new(f64::from(i), 0.0)) }).collect();
+        curved.entities.push(Entity::new(
+            Handle(20_001),
+            EntityKind::LwPolyline(LwPolyline { vertices, closed: false, const_width: 2.0, elevation: 0.0, plinegen: false }),
+        ));
+        d.blocks.insert("CurvedBands".into(), Arc::new(curved));
+        assert!(!super::build(&d, "CurvedBands").unwrap().0.prims.is_empty());
+    }
+
     /// Reject oversized leader and wipeout geometry before bounds traversal and display-list build.
     #[test]
     fn oversized_leader_and_wipeout_previews_are_rejected_before_bounds_or_rendering() {
@@ -1489,7 +1518,7 @@ mod tests {
         d.blocks.insert("BigWipeout".into(), Arc::new(w_block));
 
         // Wipeout with input + expanded mask and frame exceeding budget
-        let expanding_wipeout = EntityKind::Wipeout(Wipeout { boundary: vec![Vec2::ZERO; 6_000] });
+        let expanding_wipeout = EntityKind::Wipeout(Wipeout { boundary: vec![Vec2::ZERO; 30_000] });
         assert!(super::preview_entity_cost(&expanding_wipeout, super::MAX_PREVIEW_BUDGET).is_none());
         let mut ew_block = Block::new("ExpandingWipeout");
         ew_block.entities.push(Entity::new(Handle(3), expanding_wipeout));
@@ -1673,8 +1702,8 @@ mod tests {
                 scale: cadcraft_geom::Vec3::new(1.0, 1.0, 1.0),
                 rotation: 0.0,
                 attribs: Vec::new(),
-                cols: 100,
-                rows: 100,
+                cols: 200,
+                rows: 200,
                 col_spacing: 10.0,
                 row_spacing: 10.0,
             }),
