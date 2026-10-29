@@ -261,3 +261,19 @@ fn each_release_belongs_to_its_own_press() {
     let (_, _, later) = super::release_owners(&[primary(10.0, true), primary(10.0, false)], false, menu);
     assert!(!later);
 }
+
+#[test]
+fn a_keyword_past_the_bar_still_belongs_to_the_command_line() {
+    let mut app = crate::CadApp::new(cadcraft_engine::Session::new(), crate::Services::default());
+    let bar = egui::Rect::from_min_size(egui::pos2(100.0, 500.0), egui::vec2(200.0, 24.0));
+    // A long prompt: the last keyword sits right of the bar.
+    let keyword = egui::Rect::from_min_size(egui::pos2(320.0, 503.0), egui::vec2(40.0, 18.0));
+    app.ui.show_command_line = true;
+    app.cmd.click_rect = Some(bar.union(keyword));
+    assert!(super::widgets::over_command_line(&app, keyword.center()));
+    assert!(super::widgets::over_command_line(&app, bar.center()));
+    assert!(!super::widgets::over_command_line(&app, egui::pos2(380.0, 300.0)));
+    // A hidden command line leaves the canvas bare.
+    app.ui.show_command_line = false;
+    assert!(!super::widgets::over_command_line(&app, keyword.center()));
+}

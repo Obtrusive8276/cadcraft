@@ -38,7 +38,7 @@ use pick::{edit_text_at, hatch_at, wheel_zoom_points};
 #[cfg(test)]
 use viewport::viewport_highlight_tolerance;
 use viewport::{VpContent, VpHighlight, draw_vp_content, ensure_vp_content};
-use widgets::{draw_tiles, draw_ucs_icon, draw_viewcube, over_navigation_control, tile_rects, tile_xf, viewport_label};
+use widgets::{draw_tiles, draw_ucs_icon, draw_viewcube, over_command_line, over_navigation_control, tile_rects, tile_xf, viewport_label};
 
 /// World ↔ screen transform for the canvas rect.
 #[derive(Clone, Copy, Debug)]
@@ -719,7 +719,7 @@ fn collect_prompt_clicks(app: &mut CadApp, ui: &egui::Ui, context: PromptClickCo
                     || !context.rect.contains(*pos)
                     || over_canvas_menu(app, *pos)
                     || over_navigation_control(app, context.rect, *pos)
-                    || (app.ui.show_command_line && app.cmd.ime_rect.is_some_and(|(bar, _)| bar.contains(*pos)))
+                    || (app.ui.show_command_line && over_command_line(app, *pos))
                     || ui.ctx().layer_id_at(*pos) != Some(ui.layer_id())
                 {
                     continue;
@@ -809,7 +809,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     // the end of the frame (`hover_pos` may already be after a move, and a frame can hold several gestures).
     if ui.ctx().current_pass_index() == 0 {
         let (owners, menu_press, press_after_release) =
-            ui.input(|i| release_owners(&i.events, app.canvas.menu_press, |at| over_canvas_menu(app, at) || over_navigation_control(app, rect, at)));
+            ui.input(|i| release_owners(&i.events, app.canvas.menu_press, |at| over_canvas_menu(app, at) || over_navigation_control(app, rect, at) || over_command_line(app, at)));
         app.canvas.release_menu = owners;
         app.canvas.press_after_release = press_after_release;
         app.canvas.menu_press = menu_press;
@@ -895,6 +895,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         && pressed_primary
         && !middle_down
         && !cycled
+        && !hover_pos.is_some_and(|at| over_command_line(app, at))
         && let Some(p) = app.canvas.cursor
     {
         if app.session.prompting() {

@@ -85,6 +85,11 @@ pub(super) fn draw_viewcube(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
     p.line(vec![pos2(x, mid - 1.5), pos2(x + chevron / 2.0, mid + 1.5), pos2(x + chevron, mid - 1.5)], Stroke::new(1.2, ink));
 }
 
+/// The command-line bar or one of its inline keywords, as painted last frame.
+pub(super) fn over_command_line(app: &CadApp, p: Pos2) -> bool {
+    app.ui.show_command_line && app.cmd.click_rect.is_some_and(|r| r.contains(p))
+}
+
 /// Earlier releases in a batched frame cannot use `Response::hovered()` (it describes
 /// only the final pointer position). Reuse the exact navigation widget hit rectangles.
 pub(super) fn over_navigation_control(app: &CadApp, rect: Rect, p: Pos2) -> bool {
