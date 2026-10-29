@@ -230,3 +230,34 @@ fn dynamic_input_distance_follows_the_drawing_units() {
     let text = painted_text(&mut app, &ctx, at);
     assert!(text.contains(&format!("   {}  <", arch(c.len()))), "no {} in:\n{text}", arch(c.len()));
 }
+
+fn primary(x: f32, pressed: bool) -> egui::Event {
+    egui::Event::PointerButton { pos: egui::pos2(x, 0.0), button: egui::PointerButton::Primary, pressed, modifiers: Default::default() }
+}
+
+#[test]
+fn each_release_belongs_to_its_own_press() {
+    // A menu sits at x >= 100.
+    let menu = |p: egui::Pos2| p.x >= 100.0;
+    // A canvas click completes, then a menu press follows in the same frame: only the open gesture is the menu's.
+    let (owners, open, _) = super::release_owners(&[primary(10.0, true), primary(10.0, false), primary(120.0, true)], false, menu);
+    assert_eq!((owners, open), (vec![false], true));
+    // The mirror image: a menu click completes, then a canvas press follows.
+    let (owners, open, _) = super::release_owners(&[primary(120.0, true), primary(120.0, false), primary(10.0, true)], false, menu);
+    assert_eq!((owners, open), (vec![true], false));
+    // Two canvas clicks in one frame.
+    let (owners, open, _) =
+        super::release_owners(&[primary(10.0, true), primary(10.0, false), primary(20.0, true), primary(20.0, false)], false, menu);
+    assert_eq!((owners, open), (vec![false, false], false));
+    // A release whose press came in an earlier frame belongs to the carried gesture.
+    let (owners, open, _) = super::release_owners(&[primary(10.0, false)], true, menu);
+    assert_eq!((owners, open), (vec![true], true));
+    // A canvas press released over a menu is the menu's.
+    let (owners, open, _) = super::release_owners(&[primary(10.0, true), primary(120.0, false)], false, menu);
+    assert_eq!((owners, open), (vec![true], false));
+    // A press after the last release means that release is not the latest gesture.
+    let (_, _, later) = super::release_owners(&[primary(10.0, true), primary(10.0, false), primary(20.0, true)], false, menu);
+    assert!(later);
+    let (_, _, later) = super::release_owners(&[primary(10.0, true), primary(10.0, false)], false, menu);
+    assert!(!later);
+}

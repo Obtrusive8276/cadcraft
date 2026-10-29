@@ -502,7 +502,7 @@ fn draw_block_item(
         }
     }
     if let Some(PreviewResult::Unavailable(reason)) = result {
-        resp.on_hover_text(format!("{}\n{}", crate::tl!("Preview unavailable"), crate::i18n::t(reason.message())))
+        resp.on_hover_text(format!("{}\n{}", crate::tl!("Preview unavailable"), reason.message()))
     } else if let Some(status) = status {
         resp.on_hover_text(status)
     } else {

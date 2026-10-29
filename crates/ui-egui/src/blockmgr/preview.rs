@@ -28,11 +28,11 @@ impl PreviewFailure {
     /// The text shown in the palette for this refusal.
     pub(super) fn message(self) -> &'static str {
         match self {
-            Self::Input => "Excessive preview input",
-            Self::Computation => "Excessive preview computation",
-            Self::Output => "Excessive preview output",
-            Self::Invalid => "Invalid preview data",
-            Self::MissingReference => "Missing block reference",
+            Self::Input => crate::tl!("Excessive preview input"),
+            Self::Computation => crate::tl!("Excessive preview computation"),
+            Self::Output => crate::tl!("Excessive preview output"),
+            Self::Invalid => crate::tl!("Invalid preview data"),
+            Self::MissingReference => crate::tl!("Missing block reference"),
         }
     }
 }

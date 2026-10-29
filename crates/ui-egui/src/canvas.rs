@@ -167,6 +167,10 @@ pub struct CanvasState {
     cycle_key: Option<CycleKey>,
     /// The current primary-button gesture started on a canvas-painted menu.
     menu_press: bool,
+    /// For each primary release in the current frame, in order: whether its press was on a canvas-painted menu.
+    release_menu: Vec<bool>,
+    /// A primary press came after the frame's last release, so that release is not where the cursor is now.
+    press_after_release: bool,
 }
 
 /// The command, prompt, drawing (and its revision) and view that the objects under the cursor
@@ -681,8 +685,8 @@ struct PromptClickContext<'a> {
     xf: Xf,
     inside: bool,
     middle_down: bool,
-    menu_click: bool,
     primary_clicked: bool,
+    on_menu: bool,
     response: &'a egui::Response,
 }
 
@@ -692,15 +696,8 @@ fn collect_prompt_clicks(app: &mut CadApp, ui: &egui::Ui, context: PromptClickCo
     let point_prompt = app.session.current_prompt().is_some_and(|p| cadcraft_engine::pointmod::accepts(&p))
         && app.session.pending_window.is_none()
         && !app.session.realtime_zoom_active();
-    let pressed_primary = context.primary_clicked || (point_prompt && context.response.drag_stopped_by(egui::PointerButton::Primary));
-    if point_prompt
-        && context.inside
-        && !context.menu_click
-        && pressed_primary
-        && !context.middle_down
-        && app.cmd.options.is_none()
-        && app.cmd.buffer.is_empty()
-    {
+    let mut pressed_primary = context.primary_clicked || (point_prompt && context.response.drag_stopped_by(egui::PointerButton::Primary));
+    if point_prompt && context.inside && pressed_primary && !context.middle_down && app.cmd.options.is_none() && app.cmd.buffer.is_empty() {
         let releases: Vec<egui::Pos2> = ui.input(|i| {
             i.events
                 .iter()
@@ -710,10 +707,16 @@ fn collect_prompt_clicks(app: &mut CadApp, ui: &egui::Ui, context: PromptClickCo
                 })
                 .collect()
         });
-        // The last one is placed below, at the cursor, like any click.
-        if let Some((_, earlier)) = releases.split_last() {
-            for pos in earlier {
-                if !context.rect.contains(*pos)
+        // The last one is placed below, at the cursor, like any click, unless the cursor has since moved onto a menu
+        // (which then vetoes the click below) or another press has begun: it is placed here, where it was released.
+        let last = releases.len().saturating_sub(1);
+        for (n, pos) in releases.iter().enumerate() {
+            if n < last || context.on_menu || app.canvas.press_after_release {
+                if n == last {
+                    pressed_primary = false;
+                }
+                if app.canvas.release_menu.get(n).copied().unwrap_or(false)
+                    || !context.rect.contains(*pos)
                     || over_canvas_menu(app, *pos)
                     || over_navigation_control(app, context.rect, *pos)
                     || (app.ui.show_command_line && app.cmd.ime_rect.is_some_and(|(bar, _)| bar.contains(*pos)))
@@ -734,6 +737,29 @@ fn collect_prompt_clicks(app: &mut CadApp, ui: &egui::Ui, context: PromptClickCo
     }
 
     pressed_primary
+}
+
+/// For each primary-button release in `events`, whether the press it ends, or the release itself, was on a menu
+/// (`is_menu` at that position), and whether the gesture still open at the end of the frame started on one. `carried` is
+/// that last value from the previous frame; the third value is whether a press follows the last release, which owns a release whose press came in an earlier frame.
+fn release_owners(events: &[egui::Event], carried: bool, is_menu: impl Fn(Pos2) -> bool) -> (Vec<bool>, bool, bool) {
+    let mut current = carried;
+    let mut owners = Vec::new();
+    let mut press_after_release = false;
+    for e in events {
+        match e {
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, .. } => {
+                current = is_menu(*pos);
+                press_after_release = !owners.is_empty();
+            }
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, .. } => {
+                owners.push(current || is_menu(*pos));
+                press_after_release = false;
+            }
+            _ => {}
+        }
+    }
+    (owners, current, press_after_release)
 }
 
 /// Draw the drawing area and handle its input (zoom and pan, picking, the crosshair) for this
@@ -779,19 +805,16 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     let navigation = Navigation { rect, tiles: &tiles, response: &resp, xf, pointer };
     let Some((inside, on_menu)) = navigate_canvas(app, ui, &navigation) else { return };
     let PointerInput { hover_pos, mods, middle_down, pressed_primary, pressed_secondary, dbl_primary, .. } = pointer;
-    // A menu may close on press; retain ownership of the gesture through release.
-    if ui.ctx().current_pass_index() == 0 && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary)) {
-        // Test where the press happened (`hover_pos` may already be after a move in the same frame); the last press
-        // is the one whose release places a point.
-        let press_at = ui.input(|i| {
-            i.events.iter().rev().find_map(|e| match e {
-                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, .. } => Some(*pos),
-                _ => None,
-            })
-        });
-        app.canvas.menu_press = press_at.map_or(on_menu, |at| over_canvas_menu(app, at));
+    // A menu may close on press; each release belongs to the press before it, wherever the cursor is by
+    // the end of the frame (`hover_pos` may already be after a move, and a frame can hold several gestures).
+    if ui.ctx().current_pass_index() == 0 {
+        let (owners, menu_press, press_after_release) =
+            ui.input(|i| release_owners(&i.events, app.canvas.menu_press, |at| over_canvas_menu(app, at)));
+        app.canvas.release_menu = owners;
+        app.canvas.press_after_release = press_after_release;
+        app.canvas.menu_press = menu_press;
     }
-    let menu_click = on_menu || app.canvas.menu_press;
+    let menu_click = on_menu || app.canvas.release_menu.last().copied().unwrap_or(app.canvas.menu_press);
     // Re-read the view after navigation.
     let view = app.session.state().map(|s| s.view()).unwrap_or(view);
     let scale = f64::from(rect.height()) / view.height.max(1e-12);
@@ -827,7 +850,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     let pressed_primary = collect_prompt_clicks(
         app,
         ui,
-        PromptClickContext { rect, xf, inside, middle_down, menu_click, primary_clicked: pressed_primary, response: &resp },
+        PromptClickContext { rect, xf, inside, middle_down, primary_clicked: pressed_primary, on_menu, response: &resp },
     );
 
     let (raw_world, dyn_frame) = update_canvas_cursor(app, ui, &xf, inside, hover_pos);
