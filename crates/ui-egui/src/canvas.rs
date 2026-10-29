@@ -809,7 +809,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     // the end of the frame (`hover_pos` may already be after a move, and a frame can hold several gestures).
     if ui.ctx().current_pass_index() == 0 {
         let (owners, menu_press, press_after_release) =
-            ui.input(|i| release_owners(&i.events, app.canvas.menu_press, |at| over_canvas_menu(app, at)));
+            ui.input(|i| release_owners(&i.events, app.canvas.menu_press, |at| over_canvas_menu(app, at) || over_navigation_control(app, rect, at)));
         app.canvas.release_menu = owners;
         app.canvas.press_after_release = press_after_release;
         app.canvas.menu_press = menu_press;
