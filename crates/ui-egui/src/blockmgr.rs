@@ -77,6 +77,8 @@ pub struct State {
     pub repeating: bool,
     /// Whether the active insertion was grabbed from this palette.
     pub grabbed: bool,
+    /// The run of `INSERT` this palette started, which no other `INSERT` (typed, or from a menu) can be mistaken for.
+    pub owner: Option<u64>,
     /// The new name while renaming the selected block.
     pub rename: Option<String>,
     /// The last message (a refused delete or rename).
@@ -101,6 +103,7 @@ impl Default for State {
             show_options: true,
             repeating: false,
             grabbed: false,
+            owner: None,
             rename: None,
             note: None,
         }
@@ -818,17 +821,42 @@ fn body(ui: &mut egui::Ui, d: &Drawing, v: &View, st: &mut State, cache: &mut Pr
 
 /// Cancel an in-progress `INSERT` and stop repeat placement.
 fn cancel_pending_insert(app: &mut CadApp, st: &mut State) {
+    let is_ours = |r: &cadcraft_engine::Running| r.id == "insert" && st.owner == Some(r.serial);
+    // Only the palette's own INSERT, running or suspended by a transparent command; never another one.
+    let owned = app.session.running.as_ref().is_some_and(is_ours) || app.session.suspended.as_ref().is_some_and(is_ours);
     st.grabbed = false;
+    st.owner = None;
     st.repeating = false;
-    if app.session.running.as_ref().is_some_and(|r| r.id == "insert") {
+    if owned {
         app.session.cancel();
     }
 }
 
+/// An `INSERT` the palette did not start is in progress (running, or suspended by a transparent command).
+fn foreign_insert(app: &CadApp, st: &State) -> bool {
+    let foreign = |r: &cadcraft_engine::Running| r.id == "insert" && st.owner != Some(r.serial);
+    app.session.running.as_ref().is_some_and(foreign) || app.session.suspended.as_ref().is_some_and(foreign)
+}
+
+/// Refuse a drawing edit while someone else's `INSERT` runs: its undo snapshot would predate the
+/// edit, so undoing the insertion would also undo the palette's change.
+fn refuse_during_foreign_insert(app: &CadApp, st: &mut State) -> bool {
+    if !foreign_insert(app, st) {
+        return false;
+    }
+    st.note = Some(crate::tl!("Finish or cancel the running INSERT first").to_string());
+    true
+}
+
 /// Do what a button asked; false when the manager window should close (a command takes over).
 fn apply(app: &mut CadApp, st: &mut State, act: Option<Act>, esc_pressed: bool) -> bool {
-    if app.session.running.as_ref().is_none_or(|r| r.id != "insert") {
+    let is_ours = |r: &cadcraft_engine::Running| r.id == "insert" && st.owner == Some(r.serial);
+    let ours = app.session.running.as_ref().is_some_and(is_ours);
+    // A transparent command in front of it only suspends the palette's INSERT.
+    let owned = ours || app.session.suspended.as_ref().is_some_and(is_ours);
+    if !owned {
         st.grabbed = false;
+        st.owner = None;
     }
     if esc_pressed {
         if st.repeating {
@@ -836,12 +864,21 @@ fn apply(app: &mut CadApp, st: &mut State, act: Option<Act>, esc_pressed: bool) 
         }
         cancel_pending_insert(app, st);
     }
+    let edits = match &act {
+        Some(Act::Edit(_) | Act::Create | Act::Delete(_)) => true,
+        Some(Act::Rename(from, to)) => from != to,
+        _ => false,
+    };
+    if edits && refuse_during_foreign_insert(app, st) {
+        return true;
+    }
     match act {
         Some(Act::Grab(n)) => {
             st.rename = None;
             grab_block(app, &n, st);
             // Only track repeat-placement when the palette's own INSERT started.
-            st.grabbed = app.session.running.as_ref().is_some_and(|r| r.id == "insert");
+            st.owner = app.session.running.as_ref().filter(|r| r.id == "insert").map(|r| r.serial);
+            st.grabbed = st.owner.is_some();
             st.repeating = st.repeat && st.grabbed;
             return true;
         }
@@ -911,20 +948,16 @@ fn apply(app: &mut CadApp, st: &mut State, act: Option<Act>, esc_pressed: bool) 
         }
         None => {
             if st.repeating {
-                if esc_pressed || app.session.running.as_ref().is_none_or(|r| r.id != "insert") {
+                if esc_pressed || !owned {
                     // Repeat INSERT ended (cancelled with Esc or replaced by another command).
                     st.repeating = false;
                     st.repeat = false;
-                } else if !st.repeat && app.session.input(cadcraft_engine::Input::Keyword("NoRepeat".into())).is_ok() {
+                } else if !st.repeat && ours && app.session.input(cadcraft_engine::Input::Keyword("NoRepeat".into())).is_ok() {
                     // Repeat placement was unchecked in the palette while INSERT was running;
                     // clear palette tracking only after the engine accepts NoRepeat.
                     st.repeating = false;
                 }
-            } else if st.repeat
-                && st.grabbed
-                && app.session.running.as_ref().is_some_and(|r| r.id == "insert")
-                && app.session.input(cadcraft_engine::Input::Keyword("Repeat".into())).is_ok()
-            {
+            } else if st.repeat && st.grabbed && ours && app.session.input(cadcraft_engine::Input::Keyword("Repeat".into())).is_ok() {
                 // Repeat placement was checked after grabbing the block; arm repeat on the running INSERT.
                 st.repeating = true;
             }
@@ -1361,6 +1394,28 @@ mod tests {
         super::apply(&mut app, &mut st, None, false);
         assert!(!st.repeating);
         assert!(!st.repeat);
+
+        // A transparent command only suspends the palette's INSERT: the palette keeps it.
+        app.session.cancel();
+        st.repeat = true;
+        super::apply(&mut app, &mut st, Some(super::Act::Grab("Pin".into())), false);
+        app.session.start("'dist").unwrap();
+        assert!(app.session.suspended.is_some());
+        super::apply(&mut app, &mut st, None, false);
+        assert!(st.repeating);
+        assert!(st.grabbed);
+
+        // An INSERT started by anything else (typed with an apostrophe, say) is not the palette's to repeat.
+        app.session.cancel();
+        st.repeat = true;
+        super::apply(&mut app, &mut st, Some(super::Act::Grab("Pin".into())), false);
+        assert!(st.repeating);
+        app.session.cancel();
+        app.session.start("insert").unwrap();
+        super::apply(&mut app, &mut st, None, false);
+        assert!(!st.repeating);
+        assert!(!st.grabbed);
+        assert_eq!(app.session.running.as_ref().map(|r| r.id.as_str()), Some("insert"));
     }
 
     /// Confirming a block name unchanged closes the editor and leaves a placement in progress alone.
@@ -1391,6 +1446,46 @@ mod tests {
         // On the next frame, INSERT is still running.
         super::apply(&mut app, &mut st, None, false);
         assert_eq!(app.session.running.as_ref().map(|r| r.id.as_str()), Some("insert"));
+    }
+
+    /// Edits that change the drawing are refused while an INSERT the palette did not start is running.
+    #[test]
+    fn the_palette_refuses_edits_during_a_foreign_insert() {
+        let mut app = CadApp::new(Session::new(), Services::default());
+        let circle = app.session.execute("circle", &json!({"center": [0, 0], "radius": 2})).unwrap();
+        app.session.execute("block", &json!({"name": "Pin", "base": [0, 0], "handles": [circle["handle"]], "keep": "delete"})).unwrap();
+        let mut st = State::default();
+        app.session.start("insert").unwrap();
+        for act in [super::Act::Rename("Pin".into(), "Pin2".into()), super::Act::Delete("Pin".into()), super::Act::Edit("Pin".into()), super::Act::Create] {
+            assert!(super::apply(&mut app, &mut st, Some(act), false));
+            assert_eq!(app.session.running.as_ref().map(|r| r.id.as_str()), Some("insert"));
+            assert!(st.note.is_some());
+            st.note = None;
+        }
+        assert!(app.session.doc().is_ok_and(|d| d.blocks.contains_key("Pin") && !d.blocks.contains_key("Pin2")));
+    }
+
+    /// A palette action cancels only the INSERT the palette started, which Esc ends even while a transparent command has it suspended.
+    #[test]
+    fn the_palette_cancels_only_its_own_insert() {
+        let mut app = CadApp::new(Session::new(), Services::default());
+        let circle = app.session.execute("circle", &json!({"center": [0, 0], "radius": 2})).unwrap();
+        app.session.execute("block", &json!({"name": "Pin", "base": [0, 0], "handles": [circle["handle"]], "keep": "delete"})).unwrap();
+        let mut st = State::default();
+
+        // An INSERT started elsewhere survives a palette action.
+        app.session.start("insert").unwrap();
+        super::cancel_pending_insert(&mut app, &mut st);
+        assert_eq!(app.session.running.as_ref().map(|r| r.id.as_str()), Some("insert"));
+        app.session.cancel();
+
+        // The palette's own INSERT ends with Esc, with a transparent command in front of it too.
+        super::apply(&mut app, &mut st, Some(super::Act::Grab("Pin".into())), false);
+        app.session.start("'dist").unwrap();
+        assert!(app.session.suspended.is_some());
+        super::apply(&mut app, &mut st, None, true);
+        assert!(app.session.running.is_none());
+        assert!(app.session.suspended.is_none());
     }
 }
 

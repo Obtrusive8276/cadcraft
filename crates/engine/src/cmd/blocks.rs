@@ -680,6 +680,9 @@ impl InsertM {
     }
 }
 
+/// The keywords that switch repeat placement on or off, offered wherever INSERT waits for a number or a point.
+const REPEAT: &[&str] = &["REpeat", "NoRepeat"];
+
 fn nonzero(t: &str) -> Result<f64> {
     number(t).filter(|v| *v != 0.0).ok_or_else(|| EngineError::Other("Requires a non-zero number.".into()))
 }
@@ -701,15 +704,16 @@ impl Interactive for InsertM {
                 Prompt::new(format!("Block \"{name}\" already exists. Redefine it?"), super::curves::KW).kw(&["Yes", "No"]).default("N")
             }
             InsStage::Point => Prompt::new("Specify insertion point", Accept::POINT).kw(&["Basepoint", "Scale", "Rotate", "REpeat", "NoRepeat"]),
-            InsStage::BasePoint => Prompt::new("Specify base point", Accept::POINT),
-            InsStage::PresetScale => Prompt::new("Specify scale factor for XYZ axes", Accept::NUMBER).default("1"),
-            InsStage::PresetRotation => Prompt::new("Specify rotation angle", Accept::NUMBER).default("0"),
-            InsStage::XScale => {
-                Prompt::new("Enter X scale factor, specify opposite corner", Accept::POINT_OR_NUMBER).kw(&["Corner"]).default("1").base(at)
-            }
-            InsStage::Corner => Prompt::new("Specify opposite corner", Accept::POINT).base(at),
-            InsStage::YScale => Prompt::new("Enter Y scale factor", Accept::NUMBER).default("use X scale factor"),
-            InsStage::Rotation => Prompt::new("Specify rotation angle", Accept::POINT_OR_NUMBER).default("0").base(at),
+            InsStage::BasePoint => Prompt::new("Specify base point", Accept::POINT).kw(REPEAT),
+            InsStage::PresetScale => Prompt::new("Specify scale factor for XYZ axes", Accept::NUMBER).kw(REPEAT).default("1"),
+            InsStage::PresetRotation => Prompt::new("Specify rotation angle", Accept::NUMBER).kw(REPEAT).default("0"),
+            InsStage::XScale => Prompt::new("Enter X scale factor, specify opposite corner", Accept::POINT_OR_NUMBER)
+                .kw(&["Corner", "REpeat", "NoRepeat"])
+                .default("1")
+                .base(at),
+            InsStage::Corner => Prompt::new("Specify opposite corner", Accept::POINT).kw(REPEAT).base(at),
+            InsStage::YScale => Prompt::new("Enter Y scale factor", Accept::NUMBER).kw(REPEAT).default("use X scale factor"),
+            InsStage::Rotation => Prompt::new("Specify rotation angle", Accept::POINT_OR_NUMBER).kw(REPEAT).default("0").base(at),
             InsStage::Attribs => {
                 let (_, prompt, default) = self.attdefs.get(self.values.len()).cloned().unwrap_or_default();
                 Prompt::new(if prompt.is_empty() { "Enter attribute value".into() } else { prompt }, Accept::TEXT).default(default)
@@ -978,7 +982,8 @@ mod tests {
         s.input(Input::Enter).unwrap(); // Y scale = 1 -> now at Rotation stage
         assert!(s.current_prompt().unwrap().message.contains("rotation"));
         // Sending NoRepeat at the Rotation stage must not answer the rotation prompt or place the block yet.
-        s.input(Input::Keyword("NoRepeat".into())).unwrap();
+        assert!(s.current_prompt().unwrap().keywords.iter().any(|k| k == "NoRepeat"));
+        s.cmdline("NoRepeat").unwrap();
         assert!(s.running.is_some());
         assert!(s.current_prompt().unwrap().message.contains("rotation"));
         // Answering rotation now places the block and finishes INSERT because repeat was disarmed.
