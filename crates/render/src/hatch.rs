@@ -19,17 +19,23 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[derive(Debug)]
 pub struct HatchBudget {
     remaining: AtomicUsize,
+    failed: AtomicBool,
 }
 
 impl HatchBudget {
     /// A budget allowing `work` units of hatch computation.
     pub fn new(work: usize) -> Self {
-        Self { remaining: AtomicUsize::new(work) }
+        Self { remaining: AtomicUsize::new(work), failed: AtomicBool::new(false) }
     }
 
     /// Work units still available.
     pub fn remaining(&self) -> usize {
         self.remaining.load(Ordering::Relaxed)
+    }
+
+    /// Whether a reservation was refused. Spending the budget exactly is not a failure.
+    pub fn failed(&self) -> bool {
+        self.failed.load(Ordering::Relaxed)
     }
 }
 
@@ -39,6 +45,7 @@ pub(crate) fn charge(budget: Option<&HatchBudget>, amount: usize) -> bool {
     let mut current = budget.remaining.load(Ordering::Relaxed);
     loop {
         let Some(next) = current.checked_sub(amount) else {
+            budget.failed.store(true, Ordering::Relaxed);
             budget.remaining.store(0, Ordering::Relaxed);
             return false;
         };
@@ -122,7 +129,7 @@ pub(super) fn draw(b: &mut Builder, ctx: &Ctx, e: &Entity, h: &Hatch, rgb: Ink, 
         Some(Bounds2::from_points(v.corners().iter().map(|p| inv.apply(*p))))
     });
     let lines = pattern_lines_limited(ctx.d, h, &loops, px, view.as_ref(), b.opts.cancel.as_deref(), budget);
-    if budget.is_some_and(|b| b.remaining() == 0) {
+    if budget.is_some_and(|b| b.failed()) {
         contours(b, ctx, h, rgb, lw, tol);
         return;
     }
@@ -773,6 +780,16 @@ mod tests {
         let tris = fill::triangulate_evenodd_limited(&loops, Some(&budget)).expect("fill fits the thumbnail budget");
         assert!(!tris.is_empty());
         assert!(budget.remaining() > 0);
+    }
+
+    #[test]
+    fn spending_the_budget_exactly_is_not_a_failure() {
+        let budget = HatchBudget::new(10);
+        assert!(charge(Some(&budget), 10));
+        assert_eq!(budget.remaining(), 0);
+        assert!(!budget.failed());
+        assert!(!charge(Some(&budget), 1));
+        assert!(budget.failed());
     }
 
     #[test]

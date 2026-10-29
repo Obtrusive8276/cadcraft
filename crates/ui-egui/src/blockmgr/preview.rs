@@ -552,7 +552,7 @@ fn build_checked(d: &Drawing, name: &str) -> Checked<PreviewResult> {
     preview_block_bounds(d, name, &mut Vec::new(), Some(opts.tolerance), &mut budget)?;
     let list = cadcraft_render::build_entities_limited(d, block.entities.iter().map(|e| &**e), &opts, MAX_PRIMITIVES, MAX_VERTICES)
         .ok_or(PreviewFailure::Output)?;
-    if opts.hatch_budget.as_ref().is_some_and(|b| b.remaining() == 0) {
+    if opts.hatch_budget.as_ref().is_some_and(|b| b.failed()) {
         return Err(PreviewFailure::Computation);
     }
     finite(list.verts.iter().chain(&list.tris).flat_map(|v| [v.x, v.y]))?;
