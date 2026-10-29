@@ -38,7 +38,7 @@ use pick::{edit_text_at, hatch_at, wheel_zoom_points};
 #[cfg(test)]
 use viewport::viewport_highlight_tolerance;
 use viewport::{VpContent, VpHighlight, draw_vp_content, ensure_vp_content};
-use widgets::{draw_tiles, draw_ucs_icon, draw_viewcube, over_command_line, over_navigation_control, tile_rects, tile_xf, viewport_label};
+use widgets::{draw_tiles, draw_ucs_icon, draw_viewcube, over_command_line, over_navigation_control, tile_rects, tile_xf, viewcube_shown, viewport_label};
 
 /// World ↔ screen transform for the canvas rect.
 #[derive(Clone, Copy, Debug)]
@@ -465,7 +465,6 @@ fn paint_pointer_overlay(
     paper_rect: Option<Rect>,
     surround: Color32,
     selecting: bool,
-    sheet: Option<cadcraft_render::Sheet>,
 ) {
     let app = &mut *frame.app;
     let ui = &mut *frame.ui;
@@ -492,7 +491,7 @@ fn paint_pointer_overlay(
         draw_ucs_icon(painter, rect);
         crate::viewcube::ucs_icon(app, ui, rect);
     }
-    if app.ui.show_viewcube && sheet.is_none() {
+    if viewcube_shown(app) {
         draw_viewcube(app, ui, rect);
     }
     viewport_label(painter, rect);
@@ -1200,7 +1199,6 @@ fn paint_canvas(frame: CanvasPaint<'_>) {
         paper_rect,
         surround,
         selecting,
-        sheet,
     );
 }
 

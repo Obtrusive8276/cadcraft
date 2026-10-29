@@ -85,6 +85,13 @@ pub(super) fn draw_viewcube(app: &mut CadApp, ui: &mut egui::Ui, rect: Rect) {
     p.line(vec![pos2(x, mid - 1.5), pos2(x + chevron / 2.0, mid + 1.5), pos2(x + chevron, mid - 1.5)], Stroke::new(1.2, ink));
 }
 
+/// Whether this frame paints the ViewCube: never on a paper sheet. It follows the current space, not
+/// the display list, which is rebuilt after the frame's clicks are handled and is stale (or cleared)
+/// right after a layout switch.
+pub(super) fn viewcube_shown(app: &CadApp) -> bool {
+    app.ui.show_viewcube && !matches!(app.session.layout_space(), cadcraft_doc::Space::Paper(_))
+}
+
 /// The command-line bar or one of its inline keywords, as painted last frame.
 pub(super) fn over_command_line(app: &CadApp, p: Pos2) -> bool {
     app.ui.show_command_line && app.cmd.click_rect.is_some_and(|r| r.contains(p))
@@ -96,8 +103,7 @@ pub(super) fn over_navigation_control(app: &CadApp, rect: Rect, p: Pos2) -> bool
     if app.ui.show_ucs_icon && crate::viewcube::ucs_arms(rect).iter().any(|r| r.contains(p)) {
         return true;
     }
-    let sheet = app.canvas.list.as_ref().and_then(|l| l.sheet);
-    if app.ui.show_viewcube && sheet.is_none() {
+    if viewcube_shown(app) {
         let layout = crate::viewcube::Layout::new(rect);
         return layout.bounds.contains(p) || layout.pill.contains(p);
     }
@@ -121,11 +127,22 @@ mod tests {
         let layout = crate::viewcube::Layout::new(rect);
         let p = layout.center;
 
+        // Model space: the ViewCube is displayed and hit-tested, with or without a display list.
         app.canvas.list = None;
         assert!(super::over_navigation_control(&app, rect, p));
+        app.canvas.list = Some(DisplayList::default());
+        assert!(super::over_navigation_control(&app, rect, p));
 
-        // When the display list holds a paper sheet (before or during layout rebuild),
-        // the ViewCube is not displayed, so clicks on bare canvas are not discarded.
+        // Right after a switch to a layout the display list is still the model one (or cleared): the
+        // ViewCube is already gone, so a click there belongs to the drawing.
+        app.session.execute("layout.set", &serde_json::json!({"name": "Layout1"})).unwrap();
+        assert!(matches!(app.session.layout_space(), cadcraft_doc::Space::Paper(_)));
+        assert!(!super::over_navigation_control(&app, rect, p));
+        app.canvas.list = None;
+        assert!(!super::over_navigation_control(&app, rect, p));
+
+        // Back in the model the list may still hold the sheet, yet the ViewCube is displayed again.
+        app.session.execute("layout.set", &serde_json::json!({"name": "Model"})).unwrap();
         app.canvas.list = Some(DisplayList {
             sheet: Some(cadcraft_render::paper::Sheet {
                 size: Vec2::new(100.0, 100.0),
@@ -134,10 +151,6 @@ mod tests {
             }),
             ..Default::default()
         });
-        assert!(!super::over_navigation_control(&app, rect, p));
-
-        // Model space display list without a sheet: ViewCube is displayed and hit-tested.
-        app.canvas.list = Some(DisplayList::default());
         assert!(super::over_navigation_control(&app, rect, p));
     }
 }
