@@ -854,6 +854,9 @@ impl Interactive for InsertM {
                 {
                     let sc = Vec2::new(nonzero(x.trim())?, nonzero(y.trim())?);
                     self.scale = Some(sc);
+                    // Z follows the size of X, and an axis preset after this one starts from X and Y.
+                    self.z_scale = Some(sc.x.abs());
+                    self.axes = [Some(sc.x), Some(sc.y), Some(sc.x.abs())];
                     if self.at.is_some() {
                         return self.advance(s);
                     }
@@ -1048,6 +1051,24 @@ mod tests {
 
     /// Verify that the interactive `INSERT` prompt advertises `Repeat` and `NoRepeat`, and that
     /// `NoRepeat` disarms repeat placement at any stage without answering scale or rotation prompts.
+    #[test]
+    fn a_comma_scale_preset_replaces_the_previous_z_factor() {
+        let mut s = Session::new();
+        s.execute("line", &serde_json::json!({ "points": [[0, 0], [5, 0]] })).unwrap();
+        s.execute("block", &serde_json::json!({ "name": "B1", "base": [0, 0], "keep": "delete", "handles": ["100"] })).unwrap();
+        s.start("insert").unwrap();
+        s.cmdline("B1").unwrap();
+        s.cmdline("Scale").unwrap();
+        s.input(Input::Text("2".into())).unwrap();
+        s.cmdline("Scale").unwrap();
+        s.input(Input::Text("3,4".into())).unwrap();
+        s.input(Input::Point(Vec2::new(10.0, 0.0))).unwrap();
+        s.input(Input::Text("0".into())).unwrap();
+        let last = s.doc().unwrap().model.iter().last().cloned().unwrap();
+        let EntityKind::Insert(ins) = &last.kind else { panic!("an insert") };
+        assert_eq!((ins.scale.x, ins.scale.y, ins.scale.z), (3.0, 4.0, 3.0));
+    }
+
     #[test]
     fn a_repeated_insert_starts_again_without_the_previous_xyz_choice() {
         let mut s = Session::new();

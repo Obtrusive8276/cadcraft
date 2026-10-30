@@ -727,7 +727,11 @@ fn body(ui: &mut egui::Ui, d: &Drawing, v: &View, st: &mut State, cache: &mut Pr
                 let x_label = ui.label("X:");
                 ui.add(egui::DragValue::new(&mut st.scale_x).speed(0.05).range(0.0001..=1e6)).labelled_by(x_label.id);
                 let y_label = ui.label("Y:");
-                ui.add(egui::DragValue::new(&mut st.scale_y).speed(0.05).range(0.0001..=1e6)).labelled_by(y_label.id);
+                // An exploded insertion scales both axes by X, so Y would be ignored.
+                ui.add_enabled_ui(!st.explode, |ui| {
+                    let y = ui.add(egui::DragValue::new(&mut st.scale_y).speed(0.05).range(0.0001..=1e6)).labelled_by(y_label.id);
+                    y.on_disabled_hover_text(crate::tl!("Exploded insertion uses the X scale for both axes"));
+                });
             });
         });
         ui.horizontal(|ui| {
