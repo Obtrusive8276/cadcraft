@@ -574,7 +574,9 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui, canvas: Rect) {
     // Where the IME's composition window follows: the whole command line and the caret in it.
     let caret = Rect::from_min_size(pos2(caret_x + 1.0, bar.top() + 5.0), vec2(1.0, h - 10.0));
     app.cmd.ime_rect = Some((bar, caret));
-    app.cmd.click_rect = Some(click_rect);
+    // The history lines or window, the resize grip and the AutoComplete rows are the command line's too.
+    let z = zones(app, canvas, bar);
+    app.cmd.click_rect = Some([Some(z.all), z.lines, z.window].into_iter().flatten().fold(click_rect, Rect::union));
     // History chevron.
     crate::icons::paint(
         &p,

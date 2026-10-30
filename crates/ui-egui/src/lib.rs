@@ -417,9 +417,10 @@ impl CadApp {
         if !self.session.prompting() {
             let first = text.split_whitespace().next().unwrap_or("");
             let rest = text.trim_start().get(first.len()..).unwrap_or("").trim();
-            // A command typed alone without inline arguments runs UI-intercepted commands (like INSERT opening the palette).
-            // Inline arguments (text arguments or `{json}`) are left for the engine command line.
-            if !first.is_empty() && rest.is_empty() && menus::run_ui_command(self, &first.to_ascii_lowercase(), &Value::Null, true).is_some() {
+            // UI-intercepted commands run in the UI (INSERT opens the palette, CLOSEALL asks before discarding),
+            // except `{json}` calls and INSERT with inline arguments, which the engine command line takes.
+            let inline = rest.starts_with('{') || (!rest.is_empty() && matches!(first.to_ascii_lowercase().as_str(), "insert" | "i" | "ddinsert"));
+            if !first.is_empty() && !inline && menus::run_ui_command(self, &first.to_ascii_lowercase(), &Value::Null, true).is_some() {
                 return None;
             }
         }
@@ -457,6 +458,9 @@ impl CadApp {
         if let Some(dir) = &self.ui.last_lisp_dir {
             prefs["lispDir"] = json!(dir);
         }
+        if self.ui.blocks_window {
+            prefs["blocksWindow"] = json!(true);
+        }
         prefs.to_string()
     }
 
@@ -486,6 +490,9 @@ impl CadApp {
         }
         if let Some(dir) = v.get("lispDir").and_then(Value::as_str).filter(|d| !d.is_empty()) {
             self.ui.last_lisp_dir = Some(dir.to_string());
+        }
+        if let Some(w) = v.get("blocksWindow").and_then(Value::as_bool) {
+            self.ui.blocks_window = w;
         }
     }
 
@@ -1127,6 +1134,20 @@ mod tests {
         a.start("ui.theme.system");
         frame(&mut a, &ctx, Some(egui::Theme::Light));
         assert_eq!(ctx.options(|o| o.theme_preference), egui::ThemePreference::System);
+    }
+
+    #[test]
+    fn the_blocks_window_choice_persists() {
+        let mut a = app();
+        a.ui.blocks_window = true;
+        let mut b = app();
+        b.load_prefs(&a.prefs_json());
+        assert!(b.ui.blocks_window);
+        a.ui.blocks_window = false;
+        b.load_prefs(r#"{"blocksWindow": false}"#);
+        assert!(!b.ui.blocks_window);
+        b.load_prefs(r#"{"blocksWindow": "yes"}"#);
+        assert!(!b.ui.blocks_window, "malformed values are ignored");
     }
 
     #[test]
