@@ -519,7 +519,7 @@ impl Interactive for BlockM {
             _ => self.sel.prompt(),
         }
     }
-    /// Feed user input into the interactive `INSERT` state machine.
+    /// Feed user input into the interactive `BLOCK` state machine.
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
         match (&self.name, self.base) {
             (None, _) if self.existing.is_some() => {
@@ -1021,7 +1021,7 @@ impl Interactive for AttdefM {
             _ => Prompt::new("Specify start point of text", Accept::POINT),
         }
     }
-    /// Feed user input into the interactive `INSERT` state machine.
+    /// Feed user input into the interactive `ATTDEF` state machine.
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
         let text = match &i {
             Input::Text(t) => Some(t.clone()),
@@ -1057,8 +1057,7 @@ mod blockreplace;
 mod tests {
     use super::*;
 
-    /// Verify that the interactive `INSERT` prompt advertises `Repeat` and `NoRepeat`, and that
-    /// `NoRepeat` disarms repeat placement at any stage without answering scale or rotation prompts.
+    /// A comma-separated scale preset also sets Z to the size of X, replacing an earlier preset's Z.
     #[test]
     fn a_comma_scale_preset_replaces_the_previous_z_factor() {
         let mut s = Session::new();
@@ -1077,6 +1076,7 @@ mod tests {
         assert_eq!((ins.scale.x, ins.scale.y, ins.scale.z), (3.0, 4.0, 3.0));
     }
 
+    /// A repeated INSERT asks the default scale prompts again, not the previous placement's XYZ ones.
     #[test]
     fn a_repeated_insert_starts_again_without_the_previous_xyz_choice() {
         let mut s = Session::new();
@@ -1098,6 +1098,8 @@ mod tests {
         assert!(p.keywords.iter().any(|k| k == "XYZ"));
     }
 
+    /// Verify that the interactive `INSERT` prompt advertises `Repeat` and `NoRepeat`, and that
+    /// `NoRepeat` disarms repeat placement at any stage without answering scale or rotation prompts.
     #[test]
     fn interactive_insert_accepts_repeat_and_norepeat_across_stages() {
         let mut s = Session::new();
