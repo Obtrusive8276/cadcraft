@@ -680,6 +680,7 @@ impl InsertM {
                 self.xyz = false;
                 self.rotation = self.preset_rotation;
                 self.values.clear();
+                self.verified = 0;
                 self.stage = InsStage::Point;
                 return Ok(Step::Continue);
             }
