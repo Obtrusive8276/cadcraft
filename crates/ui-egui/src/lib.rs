@@ -57,6 +57,7 @@ pub mod palettes;
 pub mod parametric;
 pub mod plotstyles;
 pub mod quick;
+pub mod save_loss;
 pub mod shortcut_menus;
 pub mod theme;
 #[cfg(not(target_arch = "wasm32"))]
@@ -295,6 +296,10 @@ pub struct CadApp {
     pub quit_confirmed: bool,
     /// A close request waiting for "Save changes?" answers ([`closing`]).
     pub closing: Option<closing::Closing>,
+    /// A save waiting for an answer about the content the file can't keep ([`save_loss`]).
+    pub save_loss: Option<save_loss::Pending>,
+    /// The loss the user last agreed to, so saving again doesn't ask again ([`save_loss`]).
+    pub save_loss_accepted: Option<save_loss::Accepted>,
     /// Autosave (desktop; `None` until [`Self::enable_autosave`]).
     pub autosave: Option<cadcraft_engine::autosave::Autosaver>,
     /// Drawing Recovery: autosave files a crashed app left behind.
@@ -355,6 +360,8 @@ impl CadApp {
             quit_requested: false,
             quit_confirmed: false,
             closing: None,
+            save_loss: None,
+            save_loss_accepted: None,
             autosave: None,
             recovery: autosave::Recovery::default(),
             gpu_faults: std::sync::Arc::default(),
@@ -420,6 +427,13 @@ impl CadApp {
     /// Submit a line of command-line text. A refused line is echoed to the history; the error is
     /// also returned.
     pub fn cmdline(&mut self, text: &str) -> Option<String> {
+        self.cmdline_or(text, None)
+    }
+
+    /// [`CadApp::cmdline`], but a command name nothing knows (no command, alias, UI command, LISP
+    /// command or system variable) runs `fallback` instead: Enter on a partly typed name accepts
+    /// the highlighted AutoComplete suggestion.
+    pub fn cmdline_or(&mut self, text: &str, fallback: Option<&str>) -> Option<String> {
         if !self.session.prompting() {
             let first = text.split_whitespace().next().unwrap_or("");
             let rest = text.trim_start().get(first.len()..).unwrap_or("").trim();
@@ -430,7 +444,11 @@ impl CadApp {
                 return None;
             }
         }
-        let e = self.session.cmdline(text).err()?.to_string();
+        let e = match (self.session.cmdline(text), fallback) {
+            (Ok(()), _) => return None,
+            (Err(cadcraft_engine::EngineError::UnknownCommand(_)), Some(f)) => return self.cmdline(f),
+            (Err(e), _) => e.to_string(),
+        };
         self.session.echo(e.clone());
         Some(e)
     }
@@ -704,11 +722,11 @@ impl CadApp {
         ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
 
-    /// Whether a modal dialog is up: the "Save changes?" prompt or Drawing Recovery. The
+    /// Whether a modal dialog is up: the "Save changes?" prompt, the lossy-save warning or Drawing Recovery. The
     /// floating panels' own OS windows take no input meanwhile (egui's `Modal` blocks only the
     /// main window). The app's other dialogs are ordinary windows that leave the drawing usable.
     pub fn shows_modal(&self) -> bool {
-        self.close_prompt().is_some() || !self.recovery.items.is_empty()
+        self.close_prompt().is_some() || self.save_loss.is_some() || !self.recovery.items.is_empty()
     }
 
     /// Input hook: refresh the raw surface snapshot, put in keys forwarded from floating panels'
@@ -888,6 +906,7 @@ impl CadApp {
         dialogs::show(self, ui.ctx());
         palettes::patterns::prompt_picker(self, ui.ctx());
         closing::prompt(self, ui.ctx());
+        save_loss::prompt(self, ui.ctx());
         autosave::show(self, ui.ctx());
         autosave::gpu_notice(self, ui.ctx());
         self.frame_ms = now_ms() - t0;
