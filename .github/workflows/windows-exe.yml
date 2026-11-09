@@ -5,10 +5,14 @@
 # binaries are built the same way (release profile, static C runtime, PE header checks). Nothing is
 # signed: Windows SmartScreen will warn the first time the exe is run.
 #
-# Run it by hand: Actions tab > "Windows exe" > Run workflow.
+# It runs on every push to the windows-build branch (exe files are then in the run's "Artifacts"),
+# and also publishes a release when a tag starting with `win-` is pushed (or when run by hand).
 name: Windows exe
 
 on:
+  push:
+    branches: [windows-build]
+    tags: ["win-*"]
   workflow_dispatch:
     inputs:
       tag:
@@ -67,10 +71,11 @@ jobs:
           if-no-files-found: error
 
       - name: Publish the release
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag != '' && inputs.tag || format('windows-build-{0}', github.run_number) }}
+          TAG: ${{ inputs.tag != '' && inputs.tag || (github.ref_type == 'tag' && github.ref_name || format('windows-build-{0}', github.run_number)) }}
         run: |
           gh release create "$TAG" dist/release/* \
             --target "$GITHUB_SHA" \
